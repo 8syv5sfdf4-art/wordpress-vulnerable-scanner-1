@@ -38,6 +38,7 @@ pub mod analyze;
 pub(crate) mod archive;
 pub mod changes;
 pub mod db;
+pub mod dojo;
 pub mod error;
 pub(crate) mod http;
 pub mod inventory;
