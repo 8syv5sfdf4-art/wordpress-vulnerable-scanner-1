@@ -17,6 +17,7 @@ as *not checked*, not as safe.
 - [Features](#features)
 - [Install](#install)
 - [Quick start](#quick-start)
+- [Audit a whole site in one command](#audit-a-whole-site-in-one-command)
 - [The offline workflow](#the-offline-workflow)
 - [Input forms](#input-forms)
 - [Understanding the result](#understanding-the-result)
@@ -149,6 +150,85 @@ NOT CHECKED (1): not known to be safe, review by hand
     my-custom-plugin 1.0.0
 ...
 ```
+
+## Audit a whole site in one command
+
+`audit` takes the WordPress root (the directory with `wp-config.php` and
+`wp-includes`, usually `public_html`) and runs the whole pipeline: find what
+is installed, build the local database for exactly those components, scan
+offline, and write one DefectDojo file per part.
+
+```bash
+wordpress-vulnerable-scanner audit /var/www/example.com/public_html \
+  --db ~/wpvuln-db --out ~/reports/example.com
+```
+
+1. **Reconnaissance.** Core version, themes (with parent/child), plugins,
+   must-use plugins and drop-ins, read from files like WordPress does. Written
+   as `inventory.json` and `recon.md`.
+2. **Database.** Core records are pulled by version, themes and plugins by
+   slug, from WPVulnerability; the Wordfence feed is added when missing or
+   older than `--wordfence-max-age` (keyless GitHub export, or the
+   Intelligence API with `WORDFENCE_API_KEY`, which also carries CWEs the
+   export drops). `--offline` skips every download and uses the database as
+   it is.
+3. **Scan.** Offline against the database. WPVulnerability and Wordfence are
+   combined when a trustworthy Wordfence feed is stored; a feed that cannot be
+   read or fails its checksum is not used (and the run is marked incomplete),
+   and `--no-wordfence` uses WPVulnerability alone.
+4. **Reports**, in `--out` (default `reports/<site>-<date>-<time>`):
+
+| File | What |
+|---|---|
+| `defectdojo-core.json`, `defectdojo-themes.json`, `defectdojo-plugins.json` | Generic Findings Import, one per part. Every severity is always included. |
+| `report-<part>.md` | Human-readable report per part (honours `--severity`) |
+| `report.json`, `report.csv` | The whole analysis |
+| `inventory.json`, `recon.md` | What was found installed |
+| `wordfence.NOTICE.txt` | Wordfence's license notice, present when the Wordfence feed was used. Keep it with the reports: the license requires it to travel with the data. |
+| `dojo-manifest.json` | Which file goes to which DefectDojo test, and whether the files are complete |
+
+A part with nothing inventoried gets no file (an empty import would read as
+"checked, nothing found" and could close real findings); the manifest lists it
+under `skipped`. Must-use plugins and drop-ins are not wordpress.org plugins, so
+no database is asked about them by name; they appear in the plugins file as
+`Info` findings tagged `not-checked` and `not-looked-up`, to be reviewed by
+hand (so `--fail-on-unchecked` fails for any site that has one).
+
+**Complete or not.** `dojo-manifest.json` has `complete` (and the same per
+file). It is `false` when something that belongs in a file could not be put
+there: a plugins or themes folder could not be read, a lookup failed or was
+never pulled, one of several sources had no answer, the database failed its
+checksums, a stored Wordfence feed could not be read or failed its checksum
+(and was not used), or Wordfence was enabled but no feed is stored. Do not close old
+findings in DefectDojo from an incomplete run. The test title names the
+sources used (`example.com WordPress core (wordfence-api+wpvulnerability)`), so a
+run with fewer sources, such as `--no-wordfence`, lands in a different test
+and cannot close findings only the other source knew.
+
+**DefectDojo settings** come from the environment or a `.env` file (`--env
+FILE` to name one; copy `.env.example`):
+
+```text
+DEFECTDOJO_URL=https://defectdojo.example.com
+DEFECTDOJO_API_KEY=...
+DEFECTDOJO_PRODUCT=example.com        # default: the site folder name
+DEFECTDOJO_PRODUCT_TYPE=Web Application
+DEFECTDOJO_ENGAGEMENT=...             # default: "<product> audit <date>"
+DEFECTDOJO_TEST_TITLE_PREFIX=
+```
+
+They are validated before anything is downloaded. The API key never appears
+in output, files or the manifest. Uploading is not implemented yet: the
+manifest holds what a later step needs (`url`, `product`, `engagement`, and
+per file `test_title`).
+
+`--out` and `--db` must be outside the audited site (symlinks and `..` are
+resolved; a bind mount of a folder inside the site is not detected): an
+inventory and every finding inside the web root could be downloaded over
+HTTP. `--out` must be a new or empty folder, or one an earlier
+audit made (it holds a `.wpvuln-audit` marker); a folder with other files is
+refused so nothing of yours is deleted. Exit codes are those of `scan`
+(`--fail-on`, `--fail-on-unchecked`).
 
 ## The offline workflow
 
@@ -614,6 +694,8 @@ src/
   analyze.rs         matching components to vulnerabilities, states
   output.rs          human and JSON output
   report.rs          CSV, Markdown and DefectDojo output
+  pipeline.rs        audit: recon, per-part reports, manifest, completeness
+  dojo.rs            .env settings and the DefectDojo import manifest
   error.rs           error types
   http.rs            shared HTTP constants
 tests/               integration tests, fixtures and golden files

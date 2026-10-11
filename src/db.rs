@@ -829,6 +829,11 @@ pub struct Verification {
     pub untracked: usize,
     /// Everything wrong, each with what it means and how to fix it
     pub problems: Vec<String>,
+    /// The part of `problems` that concerns the Wordfence feed (also
+    /// listed in `problems`). Kept apart so a caller that does not use the
+    /// feed can leave those out without guessing from the text.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub feed_problems: Vec<String>,
     /// Lookups the inventory needs that the database lacks
     pub missing: Vec<String>,
 }
@@ -1005,7 +1010,9 @@ pub fn verify(dir: &Path, needed: &[(ComponentType, String)]) -> Verification {
         }
     }
 
-    v.problems.extend(crate::wordfence_db::verify(dir));
+    let feed = crate::wordfence_db::verify(dir);
+    v.problems.extend(feed.iter().cloned());
+    v.feed_problems = feed;
 
     for (kind, key) in needed {
         if !record_path(dir, *kind, key).is_some_and(|p| p.is_file()) {

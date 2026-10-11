@@ -329,6 +329,10 @@ fn write_not_checked<W: Write>(analysis: &Analysis, color: bool, writer: &mut W)
             ComponentState::Failed,
             "the lookup failed; run the scan again",
         ),
+        (
+            ComponentState::NotLookedUp,
+            "not wordpress.org plugins, so no database is asked by name; review them by hand",
+        ),
     ] {
         let hits: Vec<_> = analysis
             .components
@@ -346,7 +350,9 @@ fn write_not_checked<W: Write>(analysis: &Analysis, color: bool, writer: &mut W)
                 .is_some_and(|n| n.contains("looks like a renamed"));
             name_hints |= looks_renamed;
             let detail = match state {
-                ComponentState::UnknownVersion | ComponentState::Failed => c.note.clone(),
+                ComponentState::UnknownVersion
+                | ComponentState::Failed
+                | ComponentState::NotLookedUp => c.note.clone(),
                 _ if looks_renamed => c
                     .note
                     .as_deref()

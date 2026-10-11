@@ -86,4 +86,8 @@ pub enum Error {
     /// Aliases file could not be read or is invalid
     #[error("invalid aliases file: {0}")]
     Aliases(String),
+
+    /// Settings (`.env` file, environment variables) are missing or invalid
+    #[error("configuration: {0}")]
+    Config(String),
 }
