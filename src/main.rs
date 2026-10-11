@@ -8,11 +8,12 @@ use std::time::{Duration, Instant};
 
 use wordpress_vulnerable_scanner::{
     Analyzer, Severity, Source,
-    aliases::{Aliases, MatchedVia},
+    aliases::Aliases,
     changes::{Change, ChangeKind},
     db::{self, PullEvent, PullOptions, PullStatus},
     inventory::{self, Kind},
     output::{OutputConfig, OutputFormat, output_analysis, wrap},
+    pipeline::{inventory_components, pull_items},
     scanner::{
         ComponentInfo, ComponentType, ScanResult, Scanner, parse_component, parse_component_list,
     },
@@ -723,44 +724,6 @@ fn build_components(
     Ok((components, warnings))
 }
 
-/// Components to look up for an inventory, and the warnings that go with
-/// it: alias entries that cannot work, then what the inventory itself
-/// could not resolve
-fn inventory_components(
-    path: &Path,
-    aliases: Option<&Path>,
-) -> wordpress_vulnerable_scanner::Result<(Vec<ComponentInfo>, Vec<String>)> {
-    let inv = inventory::load(path)?;
-    let aliases = match aliases {
-        Some(p) => Aliases::load(p)?,
-        None => Aliases::default(),
-    };
-    let mut warnings = aliases.check(&inv);
-    warnings.extend(inv.warnings.iter().map(|w| format!("inventory: {w}")));
-
-    let mut out = Vec::new();
-    if let Some(version) = inv.core.as_ref().and_then(|c| c.version.clone()) {
-        out.push(ComponentInfo {
-            component_type: ComponentType::Core,
-            slug: "wordpress".to_string(),
-            version: Some(version),
-            installed_as: None,
-        });
-    }
-    for l in wordpress_vulnerable_scanner::aliases::lookups(&inv, &aliases) {
-        out.push(ComponentInfo {
-            component_type: match l.kind {
-                Kind::Theme => ComponentType::Theme,
-                _ => ComponentType::Plugin,
-            },
-            installed_as: (l.matched_via == MatchedVia::Alias).then_some(l.installed),
-            slug: l.slug,
-            version: l.version,
-        });
-    }
-    Ok((out, warnings))
-}
-
 fn read_manifest(
     manifest_path: &Path,
     components: &mut Vec<ComponentInfo>,
@@ -847,13 +810,7 @@ async fn run_db(cmd: &DbCommand) -> wordpress_vulnerable_scanner::Result<ExitCod
             max_age,
         } => {
             let (components, warnings) = build_components(inputs)?;
-            let items: Vec<(ComponentType, String)> = components
-                .into_iter()
-                .filter_map(|c| match c.component_type {
-                    ComponentType::Core => c.version.map(|v| (ComponentType::Core, v)),
-                    kind => Some((kind, c.slug)),
-                })
-                .collect();
+            let items = pull_items(&components);
             let opts = PullOptions {
                 api_url: api_url.clone(),
                 jobs: *jobs as usize,
@@ -1110,13 +1067,7 @@ fn verify_cli(
         Some(path) => inventory_components(path, aliases)?,
         None => (Vec::new(), Vec::new()),
     };
-    let needed: Vec<(ComponentType, String)> = components
-        .into_iter()
-        .filter_map(|c| match c.component_type {
-            ComponentType::Core => c.version.map(|v| (ComponentType::Core, v)),
-            kind => Some((kind, c.slug)),
-        })
-        .collect();
+    let needed = pull_items(&components);
     let v = db::verify(dir, &needed);
     let s = Style::stdout();
     println!("{} {}", s.bold("Verifying"), dir.display());

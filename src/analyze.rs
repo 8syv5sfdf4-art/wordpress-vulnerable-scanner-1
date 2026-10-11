@@ -29,6 +29,10 @@ pub enum ComponentState {
     UnknownVersion,
     /// The lookup failed (network error, damaged record): not checked
     Failed,
+    /// Deliberately never looked up: a must-use plugin or drop-in is not a
+    /// wordpress.org plugin, so no database can be asked about it by name.
+    /// Not checked, and to be reviewed by hand.
+    NotLookedUp,
 }
 
 impl ComponentState {
@@ -47,6 +51,7 @@ impl ComponentState {
             Self::NotInDb => "not in the local database",
             Self::UnknownVersion => "version unknown",
             Self::Failed => "lookup failed",
+            Self::NotLookedUp => "not looked up",
         }
     }
 }
@@ -68,6 +73,13 @@ pub struct StateCounts {
     pub unknown_version: usize,
     /// See [`ComponentState::Failed`]
     pub failed: usize,
+    /// See [`ComponentState::NotLookedUp`]
+    #[serde(skip_serializing_if = "is_zero")]
+    pub not_looked_up: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 impl StateCounts {
@@ -81,12 +93,13 @@ impl StateCounts {
             NotInDb => &mut self.not_in_db,
             UnknownVersion => &mut self.unknown_version,
             Failed => &mut self.failed,
+            NotLookedUp => &mut self.not_looked_up,
         } += 1;
     }
 
     /// Components that were not compared with any data
     pub fn not_checked(&self) -> usize {
-        self.untracked + self.not_in_db + self.unknown_version + self.failed
+        self.untracked + self.not_in_db + self.unknown_version + self.failed + self.not_looked_up
     }
 }
 
@@ -268,6 +281,33 @@ impl Analysis {
             warnings: self.warnings.clone(),
             sources: self.sources.clone(),
         }
+    }
+
+    /// Add a component that was deliberately never looked up (a must-use
+    /// plugin or drop-in has no entry in any database by name). It is
+    /// reported as not checked with `note` saying why, and the summary is
+    /// recomputed so the counts include it.
+    pub fn add_not_looked_up(
+        &mut self,
+        component_type: ComponentType,
+        slug: &str,
+        version: Option<&str>,
+        note: &str,
+    ) {
+        self.components.push(ComponentVulnerabilities {
+            component_type,
+            slug: slug.to_string(),
+            version: version.map(str::to_string),
+            vulnerabilities: Vec::new(),
+            max_severity: None,
+            state: ComponentState::NotLookedUp,
+            matched_via: MatchedVia::Slug,
+            installed_as: None,
+            note: Some(note.to_string()),
+            suggested_alias: None,
+            coverage: BTreeMap::new(),
+        });
+        self.summary = summarize(&self.components);
     }
 
     /// Get components by severity
@@ -988,5 +1028,23 @@ mod tests {
         assert!(themes.components.is_empty());
         assert_eq!(themes.summary.total, 0);
         assert_eq!(themes.summary.not_checked, 0);
+    }
+
+    #[test]
+    fn components_never_looked_up_count_as_not_checked() {
+        let mut a = analysis();
+        let before = a.summary.not_checked;
+        a.add_not_looked_up(
+            ComponentType::Plugin,
+            "loader",
+            None,
+            "must-use plugin: review by hand",
+        );
+        assert_eq!(a.summary.not_checked, before + 1);
+        let c = a.components.last().unwrap();
+        assert_eq!(c.state, ComponentState::NotLookedUp);
+        assert!(!c.state.checked());
+        assert_eq!(a.summary.components.not_looked_up, 1);
+        assert_eq!(a.only(ComponentType::Plugin).summary.not_checked, 5);
     }
 }

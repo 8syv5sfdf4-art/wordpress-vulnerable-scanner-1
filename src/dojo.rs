@@ -268,6 +268,11 @@ pub struct ManifestFile {
     pub test_title: String,
     /// Findings in the file (not-checked Info findings included)
     pub findings: usize,
+    /// False when something that belongs in this file could not be put
+    /// there; see `incomplete_because`
+    pub complete: bool,
+    /// Why the file may be missing findings
+    pub incomplete_because: Vec<String>,
 }
 
 /// A part that has no file, and why
@@ -281,11 +286,20 @@ pub struct SkippedPart {
 
 /// The manifest the upload step reads: what to import and where. It never
 /// contains the API key.
+///
+/// `complete` is false when `incomplete_because` has any entry: a folder
+/// that could not be read, or components whose lookup failed or was never
+/// pulled, whose real findings are therefore absent from the files. An
+/// upload must not close old findings on the strength of their absence.
+/// `inventory_warnings` is advice (leftovers, missing headers) and does
+/// not change `complete`.
 pub fn manifest(
     cfg: &DojoConfig,
     scan_date: &str,
     files: Vec<ManifestFile>,
     skipped: Vec<SkippedPart>,
+    inventory_warnings: &[String],
+    incomplete_because: &[String],
 ) -> serde_json::Value {
     let missing = cfg.missing_for_upload();
     serde_json::json!({
@@ -297,6 +311,9 @@ pub fn manifest(
         "engagement": cfg.engagement,
         "upload_ready": missing.is_empty(),
         "missing_settings": missing,
+        "complete": incomplete_because.is_empty(),
+        "incomplete_because": incomplete_because,
+        "inventory_warnings": inventory_warnings,
         "files": files,
         "skipped": skipped,
     })
@@ -481,12 +498,17 @@ mod tests {
                 file: "defectdojo-core.json".into(),
                 test_title: cfg.test_title("core"),
                 findings: 3,
+                complete: true,
+                incomplete_because: Vec::new(),
             }],
             Vec::new(),
+            &[],
+            &[],
         );
         let text = m.to_string();
         assert!(!text.contains("s3cret-token"), "{text}");
         assert_eq!(m["upload_ready"], true);
+        assert_eq!(m["complete"], true);
         assert_eq!(m["files"][0]["test_title"], "site WordPress core");
     }
 

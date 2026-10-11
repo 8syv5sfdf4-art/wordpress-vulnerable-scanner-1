@@ -43,6 +43,7 @@ pub mod error;
 pub(crate) mod http;
 pub mod inventory;
 pub mod output;
+pub mod pipeline;
 pub(crate) mod report;
 pub mod scanner;
 pub mod transfer;

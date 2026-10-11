@@ -148,7 +148,7 @@ fn serde_name(value: impl serde::Serialize) -> String {
 }
 
 /// Text safe inside a Markdown table cell
-fn md_cell(text: &str) -> String {
+pub(crate) fn md_cell(text: &str) -> String {
     text.replace('|', "\\|").replace(['\n', '\r'], " ")
 }
 
@@ -334,6 +334,11 @@ pub fn write_markdown<W: Write>(analysis: &Analysis, min: Severity, w: &mut W) -
                 "Version unknown, so ranges cannot be compared",
             ),
             (ComponentState::Failed, "Lookup failed (run the scan again)"),
+            (
+                ComponentState::NotLookedUp,
+                "Never looked up: must-use plugins and drop-ins are not wordpress.org plugins \
+                 (review by hand)",
+            ),
         ] {
             let hits: Vec<_> = analysis
                 .components
@@ -350,7 +355,9 @@ pub fn write_markdown<W: Write>(analysis: &Analysis, min: Severity, w: &mut W) -
                     .as_deref()
                     .is_some_and(|n| n.contains("looks like a renamed"));
                 let detail = match state {
-                    ComponentState::UnknownVersion | ComponentState::Failed => c
+                    ComponentState::UnknownVersion
+                    | ComponentState::Failed
+                    | ComponentState::NotLookedUp => c
                         .note
                         .as_deref()
                         .map(|n| format!(": {n}"))
@@ -571,8 +578,15 @@ pub fn write_defectdojo<W: Write>(analysis: &Analysis, min: Severity, w: &mut W)
                     c.slug
                 );
             }
+            let reason = reason.trim_end_matches(['.', ' ']).to_string();
             let mut not_checked = tags.clone();
             not_checked.push("not-checked".to_string());
+            let id_prefix = if c.state == ComponentState::NotLookedUp {
+                not_checked.push("not-looked-up".to_string());
+                "not-looked-up"
+            } else {
+                "not-checked"
+            };
             findings.push(json!({
                 "title": truncate(
                     &format!("Not checked: {name} {version} ({})", c.state.label()),
@@ -586,7 +600,7 @@ pub fn write_defectdojo<W: Write>(analysis: &Analysis, min: Severity, w: &mut W)
                 ),
                 "component_name": truncate(name, 500),
                 "component_version": truncate(version, 100),
-                "unique_id_from_tool": truncate(&format!("not-checked/{kind}/{name}"), 500),
+                "unique_id_from_tool": truncate(&format!("{id_prefix}/{kind}/{name}"), 500),
                 "active": true,
                 "verified": false,
                 "tags": not_checked,
