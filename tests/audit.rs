@@ -307,6 +307,7 @@ fn offline_without_a_database_fails_and_leaves_no_stale_manifest() {
     std::fs::create_dir_all(&out).unwrap();
     std::fs::write(out.join(".wpvuln-audit"), "").unwrap();
     std::fs::write(out.join("dojo-manifest.json"), "{\"old\":true}").unwrap();
+    std::fs::write(out.join("wordfence.NOTICE.txt"), "old copy").unwrap();
     std::fs::write(out.join("defectdojo-core.json"), "{\"findings\":[]}").unwrap();
 
     let output = run(vec![
@@ -326,6 +327,7 @@ fn offline_without_a_database_fails_and_leaves_no_stale_manifest() {
     // to the new inventory
     assert!(!out.join("dojo-manifest.json").exists());
     assert!(!out.join("defectdojo-core.json").exists());
+    assert!(!out.join("wordfence.NOTICE.txt").exists(), "stale notice");
     assert!(out.join("inventory.json").is_file());
     let _ = std::fs::remove_dir_all(&work);
 }
@@ -550,6 +552,148 @@ async fn test_titles_tell_the_wordfence_feeds_apart() {
         let m = read_json(&out.join("dojo-manifest.json"));
         let title = m["files"][0]["test_title"].as_str().unwrap().to_string();
         assert!(title.ends_with(want), "{file}: {title}");
+        assert_eq!(m["complete"], true, "{file}: {m}");
+        // the license notice travels with the reports that used the feed
+        assert!(out.join("wordfence.NOTICE.txt").is_file(), "{file}");
     }
+
+    // a missing notice beside an intact feed is put back, not "incomplete"
+    std::fs::remove_file(db.join("wordfence/wordfence.NOTICE.txt")).unwrap();
+    let again = audit(vec!["--offline".into()]);
+    let output = tokio::task::spawn_blocking(move || run(again))
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stdout).contains("restored the Wordfence license"));
+    let m = read_json(&out.join("dojo-manifest.json"));
+    assert_eq!(m["complete"], true, "{m}");
+    assert!(db.join("wordfence/wordfence.NOTICE.txt").is_file());
+
+    // a damaged feed matters only when the feed is used
+    let feed = db.join("wordfence/wordfence.json");
+    let mut bytes = std::fs::read(&feed).unwrap();
+    bytes.extend_from_slice(b"\n");
+    std::fs::write(&feed, bytes).unwrap();
+    let with_feed = audit(vec!["--offline".into()]);
+    let output = tokio::task::spawn_blocking(move || run(with_feed))
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stdout).contains("[4/4] Reports"));
+    let m = read_json(&out.join("dojo-manifest.json"));
+    assert_eq!(m["complete"], false, "{m}");
+    assert!(
+        m["incomplete_because"]
+            .to_string()
+            .contains("database problem"),
+        "{m}"
+    );
+    // ... and the untrusted feed must not drive findings or the title
+    assert!(
+        m["incomplete_because"].to_string().contains("was not used"),
+        "{m}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(stdout.contains("is not used"), "{stdout}");
+    assert!(
+        m["files"][0]["test_title"]
+            .as_str()
+            .unwrap()
+            .ends_with("(wpvulnerability)"),
+        "{m}"
+    );
+    assert!(!out.join("wordfence.NOTICE.txt").exists());
+    let without = audit(vec!["--offline".into(), "--no-wordfence".into()]);
+    let output = tokio::task::spawn_blocking(move || run(without))
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stdout).contains("[4/4] Reports"));
+    let m = read_json(&out.join("dojo-manifest.json"));
+    assert_eq!(m["complete"], true, "{m}");
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+#[tokio::test]
+async fn a_damaged_record_of_a_plugin_named_wordfence_is_never_ignored() {
+    // the Wordfence Security plugin has the slug "wordfence": its record's
+    // problems must not be mistaken for feed problems under --no-wordfence
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "/plugin/wordfence/",
+        200,
+        &record(
+            r#"{"uuid":"wf-1","name":"Wordfence < 9.0 - XSS",
+                "operator":{"max_version":"9.0","max_operator":"lt"},
+                "source":[{"id":"CVE-2026-0099"}],
+                "impact":{"cvss":{"score":"6.1"}}}"#,
+        ),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let work = temp("wfplugin");
+    let site = work.join("site");
+    std::fs::create_dir_all(site.join("wp-includes")).unwrap();
+    std::fs::create_dir_all(site.join("wp-content/plugins/wordfence")).unwrap();
+    std::fs::write(
+        site.join("wp-includes/version.php"),
+        "<?php\n$wp_version = '6.6.2';\n",
+    )
+    .unwrap();
+    std::fs::write(
+        site.join("wp-content/plugins/wordfence/wordfence.php"),
+        "<?php\n/*\nPlugin Name: Wordfence Security\nVersion: 8.0.0\n*/\n",
+    )
+    .unwrap();
+    let db = work.join("db");
+    let out = work.join("out");
+    let env_file = work.join("none.env");
+    std::fs::write(&env_file, "").unwrap();
+    let base: Vec<String> = [
+        "audit",
+        site.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--api-url",
+        &server.uri(),
+        "--no-wordfence",
+        "--env",
+        env_file.to_str().unwrap(),
+    ]
+    .map(String::from)
+    .to_vec();
+
+    let first = base.clone();
+    let output = tokio::task::spawn_blocking(move || run(first))
+        .await
+        .unwrap();
+    let text = std::fs::read_to_string(out.join("defectdojo-plugins.json")).unwrap();
+    assert!(text.contains("CVE-2026-0099"), "{text}");
+    assert_eq!(output.status.code(), Some(1));
+
+    // the stored record now says "no vulnerabilities"
+    std::fs::write(
+        db.join("plugin/wordfence.json"),
+        r#"{"error":0,"message":null,"data":{"name":"x","vulnerability":[]}}"#,
+    )
+    .unwrap();
+    let mut again = base.clone();
+    again.push("--offline".into());
+    let output = tokio::task::spawn_blocking(move || run(again))
+        .await
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(stdout.contains("database:"), "{stdout}");
+    let m = read_json(&out.join("dojo-manifest.json"));
+    assert_eq!(m["complete"], false, "{m}");
+    assert!(
+        m["incomplete_because"]
+            .to_string()
+            .contains("database problem"),
+        "{m}"
+    );
     let _ = std::fs::remove_dir_all(&work);
 }

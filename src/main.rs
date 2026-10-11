@@ -645,7 +645,8 @@ async fn run_audit(args: &AuditArgs) -> wordpress_vulnerable_scanner::Result<Exi
     pipeline::clear_previous_checked(&out, &|created| {
         if is_within_by_identity(created, &args.path) {
             return Err(wordpress_vulnerable_scanner::Error::Config(format!(
-                "--out {} is inside the site being audited; choose a folder outside it",
+                "--out {} is inside the site being audited, or its location could not be \
+                 checked; choose a folder outside it that you can read",
                 resolved(created).display()
             )));
         }
@@ -659,6 +660,21 @@ async fn run_audit(args: &AuditArgs) -> wordpress_vulnerable_scanner::Result<Exi
             web.0.display(),
             web.1
         );
+    }
+    // the notice belongs to a run that used the feed; start without one so a
+    // run that fails early cannot leave an old copy beside a new inventory
+    for name in ["wordfence.NOTICE.txt", "wordfence.NOTICE.txt.tmp"] {
+        match std::fs::remove_file(out.join(name)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("{}: {e}", out.join(name).display()),
+                )
+                .into());
+            }
+        }
     }
     let mut extra_incomplete: Vec<String> = Vec::new();
     pipeline::put(
@@ -733,6 +749,21 @@ async fn run_audit(args: &AuditArgs) -> wordpress_vulnerable_scanner::Result<Exi
     if !args.no_wordfence && !args.offline {
         audit_wordfence_pull(args).await;
     }
+    // A missing license notice next to an intact feed says nothing about
+    // findings; put it back (it is a constant) instead of calling the run
+    // incomplete, and without needing a download
+    if !args.no_wordfence {
+        match wordfence_db::restore_notice(&args.db) {
+            Ok(true) => {
+                println!("  restored the Wordfence license notice next to the stored feed")
+            }
+            Ok(false) => {}
+            Err(e) => println!(
+                "  {} could not restore the Wordfence license notice: {e}",
+                s.yellow("warning:")
+            ),
+        }
+    }
     // Records are not re-checked against their checksums while scanning, so
     // check them here, on both paths and after the Wordfence step (which
     // may have replaced a damaged feed): a damaged record that still parses
@@ -741,7 +772,7 @@ async fn run_audit(args: &AuditArgs) -> wordpress_vulnerable_scanner::Result<Exi
     for p in v
         .problems
         .iter()
-        .filter(|p| !args.no_wordfence || !p.to_ascii_lowercase().contains("wordfence"))
+        .filter(|p| !args.no_wordfence || !v.feed_problems.contains(p))
     {
         println!("  {} {p}", s.yellow("database:"));
         extra_incomplete.push(format!("database problem: {p}"));
@@ -752,11 +783,25 @@ async fn run_audit(args: &AuditArgs) -> wordpress_vulnerable_scanner::Result<Exi
     let scan = ScanResult::from_components(recon.components.clone());
     let mut analyzer = Analyzer::with_source(Source::Local(args.db.clone()))?
         .include_informational(args.include_informational);
+    let mut wordfence_used = false;
     if !args.no_wordfence {
         let feed = wordfence_db::feed_path(&args.db);
-        if feed.is_file() {
+        if feed.is_file() && !wordfence_db::feed_intact(&args.db) {
+            // changed after download, or cannot be read: it must not drive
+            // findings
+            println!(
+                "  {} the stored Wordfence feed cannot be read or fails its checksum, so it is not used",
+                s.yellow("note:")
+            );
+            extra_incomplete.push(
+                "the stored Wordfence feed cannot be read or failed its checksum, so it was not \
+                 used and findings only Wordfence knows are missing"
+                    .to_string(),
+            );
+        } else if feed.is_file() {
             let (index, detail) = load_wordfence("auto", Some(&args.db), &scan)?;
             analyzer = analyzer.with_wordfence(index, detail);
+            wordfence_used = true;
         } else {
             println!(
                 "  {} no Wordfence feed in {}; WPVulnerability only",
@@ -774,7 +819,7 @@ async fn run_audit(args: &AuditArgs) -> wordpress_vulnerable_scanner::Result<Exi
     // What the findings came from, for the DefectDojo test titles: the API
     // feed holds records the keyless GitHub export lacks
     let mut sources = vec!["wpvulnerability"];
-    if !args.no_wordfence && wordfence_db::feed_path(&args.db).is_file() {
+    if wordfence_used {
         sources.push(match wordfence_db::read_meta(&args.db).map(|m| m.source) {
             Some(wordfence_db::FeedSource::Api) => "wordfence-api",
             Some(wordfence_db::FeedSource::Github) => "wordfence-github",
@@ -786,6 +831,17 @@ async fn run_audit(args: &AuditArgs) -> wordpress_vulnerable_scanner::Result<Exi
 
     // 4. Reports
     step(4, "Reports");
+
+    // The notice goes in before write_reports, which writes the manifest
+    // last: a failed copy then stops the run with no manifest claiming a
+    // finished report set.
+    if wordfence_used {
+        pipeline::put(
+            &out,
+            "wordfence.NOTICE.txt",
+            wordfence_db::NOTICE_TEXT.as_bytes(),
+        )?;
+    }
     let written = pipeline::write_reports(
         &analysis,
         &recon,
@@ -886,6 +942,24 @@ fn inside(dir: &Path, root: &Path) -> bool {
     resolved(dir).starts_with(resolved(root))
 }
 
+/// Options for the audit's Wordfence download. An untrusted feed is
+/// replaced even inside the 30-minute guard; the server's own limit still
+/// applies.
+fn audit_pull_options(
+    source: wordfence_db::FeedSource,
+    damaged: bool,
+    api_key: Option<String>,
+) -> wordfence_db::PullOptions {
+    wordfence_db::PullOptions {
+        from: source,
+        feed: wordfence_db::Feed::Production,
+        api_key,
+        url: None,
+        force: damaged,
+        max_bytes: wordfence_db::DEFAULT_MAX_BYTES,
+    }
+}
+
 /// What `audit` does about the Wordfence feed
 #[derive(Debug, PartialEq, Eq)]
 enum WordfenceAction {
@@ -900,10 +974,13 @@ enum WordfenceAction {
 
 fn wordfence_action(
     stored: Option<&wordfence_db::Meta>,
+    stored_is_damaged: bool,
     has_key: bool,
     max_age_hours: u64,
     now: u64,
 ) -> WordfenceAction {
+    // A feed that fails its checksum is neither current nor worth keeping
+    let stored = stored.filter(|_| !stored_is_damaged);
     if let Some(m) = stored
         && max_age_hours > 0
         && now.saturating_sub(m.fetched_at) < max_age_hours.saturating_mul(3600)
@@ -983,7 +1060,34 @@ async fn audit_wordfence_pull(args: &AuditArgs) {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let has_key = args.api_key.as_deref().is_some_and(|k| !k.is_empty());
-    let source = match wordfence_action(stored.as_ref(), has_key, args.wordfence_max_age, now) {
+    if stored.is_none() && wordfence_db::feed_path(&args.db).is_file() {
+        println!(
+            "  {} the stored Wordfence feed has no readable meta file, so it cannot be \
+             checked and will be replaced.",
+            s.yellow("note:")
+        );
+    }
+    let damaged = stored.is_some() && !wordfence_db::feed_intact(&args.db);
+    if damaged && let Some(m) = &stored {
+        println!(
+            "  {} the stored Wordfence feed ({}, {} records, pulled {}) cannot be read or \
+             fails its checksum, so it is not trusted and will be replaced.",
+            s.yellow("note:"),
+            match m.source {
+                wordfence_db::FeedSource::Api => "Intelligence API",
+                wordfence_db::FeedSource::Github => "GitHub export",
+            },
+            m.records,
+            ago(m.fetched_at)
+        );
+    }
+    let source = match wordfence_action(
+        stored.as_ref(),
+        damaged,
+        has_key,
+        args.wordfence_max_age,
+        now,
+    ) {
         WordfenceAction::Current => {
             if let Some(m) = &stored {
                 println!(
@@ -1006,14 +1110,7 @@ async fn audit_wordfence_pull(args: &AuditArgs) {
         }
         WordfenceAction::Pull(source) => source,
     };
-    let opts = wordfence_db::PullOptions {
-        from: source,
-        feed: wordfence_db::Feed::Production,
-        api_key: args.api_key.clone(),
-        url: None,
-        force: false,
-        max_bytes: wordfence_db::DEFAULT_MAX_BYTES,
-    };
+    let opts = audit_pull_options(source, damaged, args.api_key.clone());
     println!(
         "  Pulling the Wordfence feed from {}",
         if source == wordfence_db::FeedSource::Api {
@@ -2342,40 +2439,75 @@ mod tests {
         let old = meta(wordfence_db::FeedSource::Api, 0);
         // stale, no key: the smaller keyless export must not replace it
         assert_eq!(
-            wordfence_action(Some(&old), false, 24, 10_000_000),
+            wordfence_action(Some(&old), false, false, 24, 10_000_000),
             WordfenceAction::KeepApi
         );
         // with a key it is refreshed from the API
         assert_eq!(
-            wordfence_action(Some(&old), true, 24, 10_000_000),
+            wordfence_action(Some(&old), false, true, 24, 10_000_000),
             WordfenceAction::Pull(wordfence_db::FeedSource::Api)
         );
+    }
+
+    #[test]
+    fn a_damaged_feed_is_pulled_past_the_rate_guard() {
+        let o = audit_pull_options(wordfence_db::FeedSource::Api, true, Some("k".into()));
+        assert!(o.force);
+        let o = audit_pull_options(wordfence_db::FeedSource::Github, false, None);
+        assert!(!o.force);
+        assert_eq!(o.from, wordfence_db::FeedSource::Github);
+    }
+
+    #[test]
+    fn a_damaged_stored_feed_is_replaced_not_kept_or_trusted() {
+        let fresh_api = meta(wordfence_db::FeedSource::Api, 9_999_000);
+        assert_eq!(
+            wordfence_action(Some(&fresh_api), true, false, 24, 10_000_000),
+            WordfenceAction::Pull(wordfence_db::FeedSource::Github)
+        );
+        assert_eq!(
+            wordfence_action(Some(&fresh_api), true, true, 24, 10_000_000),
+            WordfenceAction::Pull(wordfence_db::FeedSource::Api)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_location_counts_as_inside() {
+        let base = std::env::temp_dir().join(format!("wvs-ident-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        assert!(is_within_by_identity(
+            &base,
+            Path::new("/nonexistent-root-for-test")
+        ));
+        assert!(is_within_by_identity(&base.join("missing"), &base));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn feed_age_and_missing_feed() {
         let fresh = meta(wordfence_db::FeedSource::Github, 9_999_000);
         assert_eq!(
-            wordfence_action(Some(&fresh), false, 24, 10_000_000),
+            wordfence_action(Some(&fresh), false, false, 24, 10_000_000),
             WordfenceAction::Current
         );
         // max age 0 means always download
         assert_eq!(
-            wordfence_action(Some(&fresh), false, 0, 10_000_000),
+            wordfence_action(Some(&fresh), false, false, 0, 10_000_000),
             WordfenceAction::Pull(wordfence_db::FeedSource::Github)
         );
         assert_eq!(
-            wordfence_action(None, false, 24, 10_000_000),
+            wordfence_action(None, false, false, 24, 10_000_000),
             WordfenceAction::Pull(wordfence_db::FeedSource::Github)
         );
         assert_eq!(
-            wordfence_action(None, true, 24, 10_000_000),
+            wordfence_action(None, false, true, 24, 10_000_000),
             WordfenceAction::Pull(wordfence_db::FeedSource::Api)
         );
         // a GitHub feed may be replaced by a newer GitHub export
         let stale_github = meta(wordfence_db::FeedSource::Github, 0);
         assert_eq!(
-            wordfence_action(Some(&stale_github), false, 24, 10_000_000),
+            wordfence_action(Some(&stale_github), false, false, 24, 10_000_000),
             WordfenceAction::Pull(wordfence_db::FeedSource::Github)
         );
     }

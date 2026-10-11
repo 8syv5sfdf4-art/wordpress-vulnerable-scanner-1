@@ -530,12 +530,54 @@ pub fn import(db: &Path, file: &Path) -> Result<Meta> {
     Ok(meta)
 }
 
+/// Can the stored feed's content be trusted: its meta is readable and the
+/// feed file still has the checksum recorded at download? Stray files and a
+/// missing notice are problems for [`verify`] to report, but they say
+/// nothing about the content.
+pub fn feed_intact(db: &Path) -> bool {
+    read_meta(db)
+        .and_then(|m| sha256_file(&feed_path(db)).ok().map(|sum| sum == m.sha256))
+        .unwrap_or(false)
+}
+
+/// Write the license notice back next to a feed whose content is intact but
+/// whose notice file is gone. The notice is a constant, so this is safe to
+/// repeat; it is what `db wordfence pull` would restore. Returns whether
+/// anything was written. A feed that is not intact is left alone.
+pub fn restore_notice(db: &Path) -> std::io::Result<bool> {
+    let notice = db.join(DIR).join(NOTICE);
+    if !feed_intact(db) || std::fs::symlink_metadata(&notice).is_ok() {
+        return Ok(false);
+    }
+    // exclusive creation: never written through a symlink
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&notice)?;
+    if let Err(e) = f.write_all(NOTICE_TEXT.as_bytes()) {
+        // a truncated notice would pass verify's is_file check
+        drop(f);
+        let _ = std::fs::remove_file(&notice);
+        return Err(e);
+    }
+    Ok(true)
+}
+
 /// Problems with a stored feed, each explained; empty when it is intact
 pub fn verify(db: &Path) -> Vec<String> {
     let folder = db.join(DIR);
-    let empty = std::fs::read_dir(&folder).map_or(true, |mut d| d.next().is_none());
-    if empty {
-        return Vec::new();
+    match std::fs::read_dir(&folder) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            return vec![format!(
+                "{DIR}: cannot be read ({e}), so the stored feed cannot be checked"
+            )];
+        }
+        Ok(mut d) => {
+            if d.next().is_none() {
+                return Vec::new();
+            }
+        }
     }
     let mut problems = Vec::new();
     for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
@@ -620,4 +662,98 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
         }
     }
     Ok(hex(&hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wordfence/raw-sample.json")
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("wvs-wfdb-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn intact_means_the_content_matches_not_that_nothing_is_stray() {
+        let db = temp("intact");
+        import(&db, &sample()).unwrap();
+        assert!(feed_intact(&db));
+        assert!(verify(&db).is_empty());
+
+        // stray file and missing notice: reported, content still trusted
+        std::fs::write(db.join(DIR).join("wordfence.json.tmp"), "x").unwrap();
+        std::fs::remove_file(db.join(DIR).join(NOTICE)).unwrap();
+        assert!(feed_intact(&db));
+        assert_eq!(verify(&db).len(), 2);
+
+        // changed content: not intact
+        let feed = feed_path(&db);
+        let mut bytes = std::fs::read(&feed).unwrap();
+        bytes.push(b' ');
+        std::fs::write(&feed, bytes).unwrap();
+        assert!(!feed_intact(&db));
+
+        // no meta: not intact
+        std::fs::remove_file(db.join(DIR).join(META)).unwrap();
+        assert!(!feed_intact(&db));
+        let _ = std::fs::remove_dir_all(&db);
+    }
+
+    #[test]
+    fn a_missing_notice_is_restored_for_an_intact_feed_only() {
+        let db = temp("notice");
+        import(&db, &sample()).unwrap();
+        std::fs::remove_file(db.join(DIR).join(NOTICE)).unwrap();
+        assert_eq!(verify(&db).len(), 1);
+        assert!(restore_notice(&db).unwrap());
+        assert!(verify(&db).is_empty());
+        assert!(!restore_notice(&db).unwrap(), "nothing left to restore");
+
+        // a changed feed is not blessed by getting its notice back
+        std::fs::remove_file(db.join(DIR).join(NOTICE)).unwrap();
+        let feed = feed_path(&db);
+        let mut bytes = std::fs::read(&feed).unwrap();
+        bytes.push(b' ');
+        std::fs::write(&feed, bytes).unwrap();
+        assert!(!restore_notice(&db).unwrap());
+        assert!(!db.join(DIR).join(NOTICE).exists());
+        let _ = std::fs::remove_dir_all(&db);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_at_the_notice_is_not_written_through() {
+        let db = temp("dangling");
+        import(&db, &sample()).unwrap();
+        let notice = db.join(DIR).join(NOTICE);
+        std::fs::remove_file(&notice).unwrap();
+        let target = db.join("elsewhere.txt");
+        std::os::unix::fs::symlink(&target, &notice).unwrap();
+        assert!(!restore_notice(&db).unwrap());
+        assert!(!target.exists(), "must not create the symlink's target");
+        let _ = std::fs::remove_dir_all(&db);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_feed_folder_is_a_problem_not_silence() {
+        use std::os::unix::fs::PermissionsExt;
+        let db = temp("unlistable");
+        import(&db, &sample()).unwrap();
+        let folder = db.join(DIR);
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let can_list = std::fs::read_dir(&folder).is_ok();
+        let problems = verify(&db);
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !can_list {
+            assert_eq!(problems.len(), 1, "{problems:?}");
+            assert!(problems[0].contains("cannot be read"));
+        }
+        let _ = std::fs::remove_dir_all(&db);
+    }
 }

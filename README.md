@@ -172,7 +172,10 @@ wordpress-vulnerable-scanner audit /var/www/example.com/public_html \
    Intelligence API with `WORDFENCE_API_KEY`, which also carries CWEs the
    export drops). `--offline` skips every download and uses the database as
    it is.
-3. **Scan.** Offline against the database; both sources are combined.
+3. **Scan.** Offline against the database. WPVulnerability and Wordfence are
+   combined when a trustworthy Wordfence feed is stored; a feed that cannot be
+   read or fails its checksum is not used (and the run is marked incomplete),
+   and `--no-wordfence` uses WPVulnerability alone.
 4. **Reports**, in `--out` (default `reports/<site>-<date>-<time>`):
 
 | File | What |
@@ -181,6 +184,7 @@ wordpress-vulnerable-scanner audit /var/www/example.com/public_html \
 | `report-<part>.md` | Human-readable report per part (honours `--severity`) |
 | `report.json`, `report.csv` | The whole analysis |
 | `inventory.json`, `recon.md` | What was found installed |
+| `wordfence.NOTICE.txt` | Wordfence's license notice, present when the Wordfence feed was used. Keep it with the reports: the license requires it to travel with the data. |
 | `dojo-manifest.json` | Which file goes to which DefectDojo test, and whether the files are complete |
 
 A part with nothing inventoried gets no file (an empty import would read as
@@ -194,7 +198,8 @@ hand (so `--fail-on-unchecked` fails for any site that has one).
 file). It is `false` when something that belongs in a file could not be put
 there: a plugins or themes folder could not be read, a lookup failed or was
 never pulled, one of several sources had no answer, the database failed its
-checksums, or Wordfence was enabled but no feed is stored. Do not close old
+checksums, a stored Wordfence feed could not be read or failed its checksum
+(and was not used), or Wordfence was enabled but no feed is stored. Do not close old
 findings in DefectDojo from an incomplete run. The test title names the
 sources used (`example.com WordPress core (wordfence-api+wpvulnerability)`), so a
 run with fewer sources, such as `--no-wordfence`, lands in a different test
@@ -689,6 +694,8 @@ src/
   analyze.rs         matching components to vulnerabilities, states
   output.rs          human and JSON output
   report.rs          CSV, Markdown and DefectDojo output
+  pipeline.rs        audit: recon, per-part reports, manifest, completeness
+  dojo.rs            .env settings and the DefectDojo import manifest
   error.rs           error types
   http.rs            shared HTTP constants
 tests/               integration tests, fixtures and golden files

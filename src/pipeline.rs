@@ -1194,6 +1194,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&out);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn an_unreadable_folder_makes_the_manifest_incomplete() {
         use std::os::unix::fs::PermissionsExt;

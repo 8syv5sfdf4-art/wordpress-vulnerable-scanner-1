@@ -4,3 +4,6 @@ Cargo.lock
 .env
 .env.*
 !.env.example
+/wpvuln-db/
+/db-api/
+/reports/
