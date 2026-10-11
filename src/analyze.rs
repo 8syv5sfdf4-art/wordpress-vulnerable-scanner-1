@@ -245,6 +245,31 @@ impl Analysis {
         self.components.iter().filter(|c| c.has_vulnerabilities())
     }
 
+    /// The same analysis restricted to one kind of component (core, themes
+    /// or plugins), with the summary recomputed so it describes only those
+    /// components. Sources, warnings and scan metadata are kept: a per-part
+    /// report still has to name where its data came from.
+    ///
+    /// The result has no components when the scan found none of that kind
+    /// (no themes, or no readable core version). That is "nothing was
+    /// inventoried", not "clean"; callers that write a report must say so.
+    pub fn only(&self, kind: ComponentType) -> Analysis {
+        let components: Vec<ComponentVulnerabilities> = self
+            .components
+            .iter()
+            .filter(|c| c.component_type == kind)
+            .cloned()
+            .collect();
+        Analysis {
+            url: self.url.clone(),
+            scan_date: self.scan_date.clone(),
+            summary: summarize(&components),
+            components,
+            warnings: self.warnings.clone(),
+            sources: self.sources.clone(),
+        }
+    }
+
     /// Get components by severity
     pub fn components_by_severity(&self, severity: Severity) -> Vec<&ComponentVulnerabilities> {
         self.components
@@ -252,6 +277,27 @@ impl Analysis {
             .filter(|c| c.max_severity == Some(severity))
             .collect()
     }
+}
+
+/// Severity counts, per-state counts and per-source gaps for a set of
+/// components
+fn summarize(components: &[ComponentVulnerabilities]) -> VulnerabilitySummary {
+    let all_vulns: Vec<&Vulnerability> = components
+        .iter()
+        .flat_map(|c| c.vulnerabilities.iter())
+        .collect();
+
+    let mut summary = VulnerabilitySummary::from_refs(&all_vulns);
+    for c in components {
+        summary.components.add(c.state);
+        for (source, cov) in &c.coverage {
+            if *cov != Coverage::Tracked {
+                *summary.not_checked_by.entry(*source).or_default() += 1;
+            }
+        }
+    }
+    summary.not_checked = summary.components.not_checked();
+    summary
 }
 
 /// What one source said about a component
@@ -365,22 +411,7 @@ impl Analyzer {
 
         let components: Vec<ComponentVulnerabilities> = join_all(futures).await;
 
-        // Build summary from all vulnerabilities
-        let all_vulns: Vec<&Vulnerability> = components
-            .iter()
-            .flat_map(|c| c.vulnerabilities.iter())
-            .collect();
-
-        let mut summary = VulnerabilitySummary::from_refs(&all_vulns);
-        for c in &components {
-            summary.components.add(c.state);
-            for (source, cov) in &c.coverage {
-                if *cov != Coverage::Tracked {
-                    *summary.not_checked_by.entry(*source).or_default() += 1;
-                }
-            }
-        }
-        summary.not_checked = summary.components.not_checked();
+        let summary = summarize(&components);
 
         Analysis {
             url: if scan.url.is_empty() {
@@ -766,4 +797,196 @@ pub(crate) fn iso_date(secs: u64) -> String {
 
 fn is_leap_year(year: u64) -> bool {
     year.is_multiple_of(4) && !year.is_multiple_of(100) || year.is_multiple_of(400)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vuln(severity: &str) -> Vulnerability {
+        serde_json::from_value(serde_json::json!({
+            "id": "x", "title": "t", "severity": severity, "cvss_score": null,
+            "affected_max": null, "fixed_in": null, "references": []
+        }))
+        .unwrap()
+    }
+
+    fn component(
+        kind: ComponentType,
+        slug: &str,
+        state: ComponentState,
+        vulns: Vec<Vulnerability>,
+    ) -> ComponentVulnerabilities {
+        ComponentVulnerabilities {
+            component_type: kind,
+            slug: slug.into(),
+            version: Some("1.0".into()),
+            max_severity: vulns.iter().map(|v| v.severity).max(),
+            vulnerabilities: vulns,
+            state,
+            matched_via: MatchedVia::Slug,
+            installed_as: None,
+            note: None,
+            suggested_alias: None,
+            coverage: BTreeMap::new(),
+        }
+    }
+
+    fn with_coverage(
+        mut c: ComponentVulnerabilities,
+        cov: &[(SourceKind, Coverage)],
+    ) -> ComponentVulnerabilities {
+        c.coverage = cov.iter().cloned().collect();
+        c
+    }
+
+    fn analysis() -> Analysis {
+        use ComponentState::*;
+        let components = vec![
+            with_coverage(
+                component(
+                    ComponentType::Core,
+                    "wordpress",
+                    Vulnerable,
+                    vec![vuln("critical"), vuln("medium")],
+                ),
+                &[
+                    (SourceKind::WpVulnerability, Coverage::Tracked),
+                    (SourceKind::Wordfence, Coverage::Tracked),
+                ],
+            ),
+            with_coverage(
+                component(
+                    ComponentType::Plugin,
+                    "akismet",
+                    AliasMatch,
+                    vec![vuln("high")],
+                ),
+                &[
+                    (SourceKind::WpVulnerability, Coverage::Tracked),
+                    (SourceKind::Wordfence, Coverage::Untracked),
+                ],
+            ),
+            with_coverage(
+                component(ComponentType::Plugin, "mine", Untracked, vec![]),
+                &[
+                    (SourceKind::WpVulnerability, Coverage::Untracked),
+                    (SourceKind::Wordfence, Coverage::Untracked),
+                ],
+            ),
+            with_coverage(
+                component(ComponentType::Plugin, "gone", Failed, vec![]),
+                &[(SourceKind::WpVulnerability, Coverage::Failed)],
+            ),
+            component(ComponentType::Plugin, "new", NotInDb, vec![]),
+            component(ComponentType::Plugin, "odd", UnknownVersion, vec![]),
+            component(ComponentType::Theme, "astra", Clean, vec![]),
+        ];
+        Analysis {
+            url: None,
+            scan_date: "2026-01-01T00:00:00Z".into(),
+            summary: summarize(&components),
+            components,
+            warnings: vec!["w".into()],
+            sources: vec![SourceInfo {
+                source: SourceKind::Wordfence,
+                detail: "feed".into(),
+                attribution: Some("Copyright Defiant".into()),
+            }],
+        }
+    }
+
+    #[test]
+    fn parts_add_up_to_the_whole() {
+        let a = analysis();
+        let parts: Vec<Analysis> = [
+            ComponentType::Core,
+            ComponentType::Plugin,
+            ComponentType::Theme,
+        ]
+        .into_iter()
+        .map(|k| a.only(k))
+        .collect();
+        let sum = |f: &dyn Fn(&VulnerabilitySummary) -> usize| {
+            parts.iter().map(|p| f(&p.summary)).sum::<usize>()
+        };
+        let w = &a.summary;
+        assert_eq!(sum(&|s| s.critical), w.critical);
+        assert_eq!(sum(&|s| s.high), w.high);
+        assert_eq!(sum(&|s| s.medium), w.medium);
+        assert_eq!(sum(&|s| s.low), w.low);
+        assert_eq!(sum(&|s| s.total), w.total);
+        assert_eq!(sum(&|s| s.not_checked), w.not_checked);
+        assert_eq!(sum(&|s| s.components.vulnerable), w.components.vulnerable);
+        assert_eq!(sum(&|s| s.components.alias_match), w.components.alias_match);
+        assert_eq!(sum(&|s| s.components.clean), w.components.clean);
+        assert_eq!(sum(&|s| s.components.untracked), w.components.untracked);
+        assert_eq!(sum(&|s| s.components.not_in_db), w.components.not_in_db);
+        assert_eq!(
+            sum(&|s| s.components.unknown_version),
+            w.components.unknown_version
+        );
+        assert_eq!(sum(&|s| s.components.failed), w.components.failed);
+        for source in [SourceKind::WpVulnerability, SourceKind::Wordfence] {
+            let parts_n: usize = parts
+                .iter()
+                .map(|p| p.summary.not_checked_by.get(&source).copied().unwrap_or(0))
+                .sum();
+            assert_eq!(parts_n, w.not_checked_by.get(&source).copied().unwrap_or(0));
+        }
+    }
+
+    #[test]
+    fn only_keeps_one_kind_and_recomputes_the_summary() {
+        let a = analysis();
+        assert_eq!(a.summary.total, 3);
+        assert_eq!(a.summary.not_checked, 4);
+
+        let core = a.only(ComponentType::Core);
+        assert_eq!(core.components.len(), 1);
+        assert_eq!((core.summary.critical, core.summary.medium), (1, 1));
+        assert_eq!(core.summary.total, 2);
+        assert_eq!(core.summary.not_checked, 0);
+        assert!(core.summary.not_checked_by.is_empty());
+
+        let plugins = a.only(ComponentType::Plugin);
+        assert_eq!(plugins.components.len(), 5);
+        assert_eq!((plugins.summary.high, plugins.summary.total), (1, 1));
+        assert_eq!(plugins.summary.components.alias_match, 1);
+        assert_eq!(plugins.summary.not_checked, 4);
+        // akismet and mine: Wordfence has no entry; mine and gone: WPVuln
+        // has none or failed
+        assert_eq!(
+            plugins.summary.not_checked_by.get(&SourceKind::Wordfence),
+            Some(&2)
+        );
+        assert_eq!(
+            plugins
+                .summary
+                .not_checked_by
+                .get(&SourceKind::WpVulnerability),
+            Some(&2)
+        );
+        assert_eq!(plugins.warnings, a.warnings);
+        assert_eq!(plugins.sources.len(), 1);
+        assert_eq!(
+            plugins.sources[0].attribution.as_deref(),
+            Some("Copyright Defiant")
+        );
+
+        let themes = a.only(ComponentType::Theme);
+        assert_eq!(themes.summary.total, 0);
+        assert_eq!(themes.summary.components.clean, 1);
+    }
+
+    #[test]
+    fn a_kind_with_no_components_gives_an_empty_analysis() {
+        let mut a = analysis();
+        a.components
+            .retain(|c| c.component_type != ComponentType::Theme);
+        let themes = a.only(ComponentType::Theme);
+        assert!(themes.components.is_empty());
+        assert_eq!(themes.summary.total, 0);
+        assert_eq!(themes.summary.not_checked, 0);
+    }
 }
