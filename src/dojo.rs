@@ -248,10 +248,13 @@ impl DojoConfig {
         missing
     }
 
-    /// Title of the DefectDojo test one part is imported as
-    pub fn test_title(&self, part: &str) -> String {
+    /// Title of the DefectDojo test one part is imported as. It names the
+    /// sources the findings came from (`wordfence-api+wpvulnerability`): a run
+    /// with fewer sources lands in a different test, so it can never close
+    /// findings that only another source knew.
+    pub fn test_title(&self, part: &str, sources: &str) -> String {
         format!(
-            "{}{} WordPress {part}",
+            "{}{} WordPress {part} ({sources})",
             self.test_title_prefix, self.product
         )
     }
@@ -300,6 +303,7 @@ pub fn manifest(
     skipped: Vec<SkippedPart>,
     inventory_warnings: &[String],
     incomplete_because: &[String],
+    sources: &[String],
 ) -> serde_json::Value {
     let missing = cfg.missing_for_upload();
     serde_json::json!({
@@ -314,6 +318,7 @@ pub fn manifest(
         "complete": incomplete_because.is_empty(),
         "incomplete_because": incomplete_because,
         "inventory_warnings": inventory_warnings,
+        "sources": sources,
         "files": files,
         "skipped": skipped,
     })
@@ -496,7 +501,7 @@ mod tests {
             vec![ManifestFile {
                 part: "core".into(),
                 file: "defectdojo-core.json".into(),
-                test_title: cfg.test_title("core"),
+                test_title: cfg.test_title("core", "wpvulnerability"),
                 findings: 3,
                 complete: true,
                 incomplete_because: Vec::new(),
@@ -504,12 +509,16 @@ mod tests {
             Vec::new(),
             &[],
             &[],
+            &[],
         );
         let text = m.to_string();
         assert!(!text.contains("s3cret-token"), "{text}");
         assert_eq!(m["upload_ready"], true);
         assert_eq!(m["complete"], true);
-        assert_eq!(m["files"][0]["test_title"], "site WordPress core");
+        assert_eq!(
+            m["files"][0]["test_title"],
+            "site WordPress core (wpvulnerability)"
+        );
     }
 
     #[test]

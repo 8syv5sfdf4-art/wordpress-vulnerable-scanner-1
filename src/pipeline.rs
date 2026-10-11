@@ -155,12 +155,23 @@ fn unreadable_dirs(root: &Path) -> Vec<String> {
 /// file names
 pub fn site_name(root: &Path) -> String {
     let abs = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    // lossy, not skipped: two sites whose folders differ only in non-UTF-8
+    // bytes must not end up with the name of their parent
     let mut names = abs
         .components()
         .rev()
-        .filter_map(|c| c.as_os_str().to_str().map(str::to_string));
+        .map(|c| c.as_os_str().to_string_lossy().into_owned());
     let mut name = names.next().unwrap_or_default();
-    if matches!(
+    if abs.is_file() {
+        // an archive is named after itself, without its extension
+        let lower = name.to_ascii_lowercase();
+        for suffix in [".tar.gz", ".tgz", ".tar", ".zip"] {
+            if lower.ends_with(suffix) {
+                name.truncate(name.len() - suffix.len());
+                break;
+            }
+        }
+    } else if matches!(
         name.as_str(),
         "public_html" | "htdocs" | "www" | "html" | "httpdocs"
     ) && let Some(parent) = names.next()
@@ -377,10 +388,21 @@ pub struct Written {
 
 /// Write `bytes` to `dir/name` through a temporary file, so a reader never
 /// sees a half-written report. Errors name the file.
-fn put(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+pub fn put(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     let path = dir.join(name);
     let tmp = dir.join(format!("{name}.tmp"));
-    std::fs::write(&tmp, bytes)
+    // a leftover (or a planted symlink) at the temporary name is removed,
+    // never written through
+    let _ = std::fs::remove_file(&tmp);
+    let write = || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.write_all(bytes)
+    };
+    write()
         .and_then(|()| std::fs::rename(&tmp, &path))
         .map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
@@ -401,6 +423,87 @@ fn remove_old(dir: &Path, name: &str) -> Result<()> {
     }
 }
 
+/// Marker file that says an audit made (and may clear) a folder
+const MARKER: &str = ".wpvuln-audit";
+
+/// Create `out` and remove what an earlier audit left in it: the manifest
+/// first (so nothing points at files that are about to change), then the
+/// per-part and combined reports. Call it before writing anything else into
+/// the folder, so a run that fails halfway leaves no stale results next to
+/// its new inventory.
+pub fn clear_previous(out: &Path) -> Result<()> {
+    clear_previous_checked(out, &|_| Ok(()))
+}
+
+/// [`clear_previous`], with `check` run on the folder after it exists and
+/// before anything is written or removed in it. When `check` refuses and
+/// this call created the folder, the folder is removed again.
+pub fn clear_previous_checked(out: &Path, check: &dyn Fn(&Path) -> Result<()>) -> Result<()> {
+    let named = |e: std::io::Error| {
+        Error::from(std::io::Error::new(
+            e.kind(),
+            format!("{}: {e}", out.display()),
+        ))
+    };
+    // Only ever clear a folder an audit made: some of the names below
+    // (report.json, report.csv) are generic and could be someone's files
+    let marker = out.join(MARKER);
+    let marked = std::fs::symlink_metadata(&marker).is_ok_and(|m| m.is_file());
+    if out.is_dir() && !marked {
+        let empty = std::fs::read_dir(out).map_err(named)?.next().is_none();
+        if !empty {
+            return Err(Error::Config(format!(
+                "{} already holds files that this tool did not write. Choose an empty or new \
+                 folder with --out so nothing of yours is deleted or overwritten.",
+                out.display()
+            )));
+        }
+    }
+    // the folders this call is about to create, deepest first, so a refusal
+    // can take them away again
+    let mut created = Vec::new();
+    let mut cur = Some(out);
+    while let Some(dir) = cur {
+        if dir.exists() || dir.as_os_str().is_empty() {
+            break;
+        }
+        created.push(dir.to_path_buf());
+        cur = dir.parent();
+    }
+    std::fs::create_dir_all(out).map_err(named)?;
+    if let Err(e) = check(out) {
+        for dir in &created {
+            let _ = std::fs::remove_dir(dir);
+        }
+        return Err(e);
+    }
+    if !marked {
+        std::fs::write(
+            &marker,
+            "Made by wordpress-vulnerable-scanner audit. Its reports are replaced on each run.\n",
+        )
+        .map_err(named)?;
+    }
+    let mut names = vec![
+        "dojo-manifest.json".to_string(),
+        "report.json".to_string(),
+        "report.csv".to_string(),
+    ];
+    for part in Part::ALL {
+        names.push(format!("defectdojo-{}.json", part.name()));
+        names.push(format!("report-{}.md", part.name()));
+    }
+    for name in names {
+        remove_old(out, &name)?;
+        remove_old(out, &format!("{name}.tmp"))?;
+    }
+    // written by the command around write_reports, same temporary scheme
+    for name in ["inventory.json.tmp", "recon.md.tmp"] {
+        remove_old(out, name)?;
+    }
+    Ok(())
+}
+
 /// Write the reports of an audit into `out`: per part a DefectDojo file and
 /// a Markdown report, plus the whole analysis as JSON and CSV, and the
 /// import manifest.
@@ -419,17 +522,25 @@ fn remove_old(dir: &Path, name: &str) -> Result<()> {
 /// - The DefectDojo files always carry every severity. `min` filters only
 ///   the human-readable Markdown and CSV; filtering the import would make a
 ///   vulnerable component look clean and let a reimport close its findings.
+/// - `sources_key` names the sources the findings came from
+///   (`wordfence-api+wpvulnerability`); without it the analysis's own source
+///   names are used. It goes into every test title, so runs with different
+///   sources never share a DefectDojo test.
 /// - A file is `complete: false` in the manifest when a component of its
 ///   part was not compared with any data (lookup failed, never pulled,
-///   version unknown): its real findings are absent and only a not-checked
-///   Info finding stands in for them. So is the whole manifest when a
-///   folder could not be read.
+///   version unknown), or when one of several sources had no answer for it
+///   (findings only that source knows are absent). Only a not-checked Info
+///   finding stands in for the first kind. The whole manifest is incomplete
+///   when a folder could not be read, and `extra_incomplete` adds reasons
+///   only the caller knows (a source that was expected but not loaded).
 pub fn write_reports(
     analysis: &Analysis,
     recon: &Recon,
     out: &Path,
     min: Severity,
     dojo_cfg: &DojoConfig,
+    sources_key: Option<&str>,
+    extra_incomplete: &[String],
 ) -> Result<Written> {
     let mut analysis = analysis.clone();
     for w in &recon.warnings {
@@ -440,36 +551,32 @@ pub fn write_reports(
     add_unlooked(&mut analysis, &recon.inventory);
     let analysis = &analysis;
 
-    std::fs::create_dir_all(out).map_err(|e| {
-        Error::from(std::io::Error::new(
-            e.kind(),
-            format!("{}: {e}", out.display()),
-        ))
-    })?;
-    for name in ["dojo-manifest.json", "report.json", "report.csv"] {
-        remove_old(out, name)?;
-        remove_old(out, &format!("{name}.tmp"))?;
-    }
-    for part in Part::ALL {
-        for name in [
-            format!("defectdojo-{}.json", part.name()),
-            format!("report-{}.md", part.name()),
-        ] {
-            remove_old(out, &name)?;
-            remove_old(out, &format!("{name}.tmp"))?;
-        }
-    }
+    clear_previous(out)?;
     let render = |a: &Analysis, format: OutputFormat, min: Severity| -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         output_analysis(a, &OutputConfig::new(format, min), &mut buf)?;
         Ok(buf)
     };
 
+    let sources_key = match sources_key {
+        Some(k) => k.to_string(),
+        None => {
+            let mut names: Vec<String> = analysis
+                .sources
+                .iter()
+                .map(|s| crate::analyze::source_name(s.source).to_ascii_lowercase())
+                .collect();
+            names.sort();
+            names.dedup();
+            names.join("+")
+        }
+    };
     let mut incomplete_because: Vec<String> = recon
         .unreadable
         .iter()
         .map(|d| format!("{d} could not be read, so what is installed there is not in the reports"))
         .collect();
+    incomplete_because.extend(extra_incomplete.iter().cloned());
     let mut parts = Vec::new();
     let mut files = Vec::new();
     let mut skipped = Vec::new();
@@ -531,14 +638,44 @@ pub fn write_reports(
                 ));
             }
         }
+        // With several sources a component can be "checked" by one while
+        // the other failed: what only the failed one knows is missing
+        let gaps = a
+            .components
+            .iter()
+            .filter(|c| {
+                c.coverage.len() > 1
+                    && c.coverage.values().any(|v| {
+                        matches!(
+                            v,
+                            crate::analyze::Coverage::Failed | crate::analyze::Coverage::NotInDb
+                        )
+                    })
+            })
+            .count();
+        if gaps > 0 {
+            why.push(format!(
+                "{gaps} {} component(s): one data source had no answer (lookup failed or not \
+                 pulled), so findings only that source knows are not in {file}",
+                part.name()
+            ));
+        }
         incomplete_because.extend(why.iter().cloned());
+        let mut file_reasons = why;
+        file_reasons.extend(
+            recon
+                .unreadable
+                .iter()
+                .map(|d| format!("{d} could not be read")),
+        );
+        file_reasons.extend(extra_incomplete.iter().cloned());
         files.push(ManifestFile {
             part: part.name().to_string(),
             file: file.clone(),
-            test_title: dojo_cfg.test_title(part.name()),
+            test_title: dojo_cfg.test_title(part.name(), &sources_key),
             findings,
-            complete: why.is_empty() && recon.unreadable.is_empty(),
-            incomplete_because: why,
+            complete: file_reasons.is_empty(),
+            incomplete_because: file_reasons,
         });
         parts.push(PartResult {
             part,
@@ -565,6 +702,11 @@ pub fn write_reports(
         skipped,
         &recon.warnings,
         &incomplete_because,
+        &analysis
+            .sources
+            .iter()
+            .map(|s| format!("{}: {}", crate::analyze::source_name(s.source), s.detail))
+            .collect::<Vec<_>>(),
     );
     put(
         out,
@@ -815,7 +957,7 @@ mod tests {
 
         let out = temp_dir("nover-out");
         let a = unpulled(&r, &out.join("no-db")).await;
-        let w = write_reports(&a, &r, &out, Severity::Low, &cfg()).unwrap();
+        let w = write_reports(&a, &r, &out, Severity::Low, &cfg(), None, &[]).unwrap();
         let core_state = w
             .analysis
             .components
@@ -836,7 +978,7 @@ mod tests {
         let out = temp_dir("all");
         let r = recon(&fixture(), None).unwrap();
         let a = unpulled(&r, &out.join("no-db")).await;
-        let w = write_reports(&a, &r, &out, Severity::Low, &cfg()).unwrap();
+        let w = write_reports(&a, &r, &out, Severity::Low, &cfg(), None, &[]).unwrap();
         assert_eq!(w.parts.len(), 3);
 
         for (part, own) in [("core", "core"), ("themes", "theme"), ("plugins", "plugin")] {
@@ -874,7 +1016,7 @@ mod tests {
         let r = recon(&site.root, None).unwrap();
         let out = temp_dir("noth-out");
         let a = unpulled(&r, &out.join("no-db")).await;
-        write_reports(&a, &r, &out, Severity::Low, &cfg()).unwrap();
+        write_reports(&a, &r, &out, Severity::Low, &cfg(), None, &[]).unwrap();
 
         assert!(out.join("defectdojo-plugins.json").is_file());
         for absent in ["defectdojo-themes.json", "report-themes.md"] {
@@ -901,7 +1043,7 @@ mod tests {
         let r = recon(&site.root, None).unwrap();
         let out = temp_dir("sev-out");
         let a = vulnerable_plugin(&r);
-        let w = write_reports(&a, &r, &out, Severity::High, &cfg()).unwrap();
+        let w = write_reports(&a, &r, &out, Severity::High, &cfg(), None, &[]).unwrap();
 
         let f = findings(&out.join("defectdojo-plugins.json"));
         assert_eq!(f.len(), 1);
@@ -924,7 +1066,7 @@ mod tests {
         let out = temp_dir("stale-out");
         let r = recon(&site.root, None).unwrap();
         let a = unpulled(&r, &out.join("no-db")).await;
-        write_reports(&a, &r, &out, Severity::Low, &cfg()).unwrap();
+        write_reports(&a, &r, &out, Severity::Low, &cfg(), None, &[]).unwrap();
         assert!(out.join("defectdojo-themes.json").is_file());
         assert!(out.join("report-themes.md").is_file());
         std::fs::write(out.join("report.json.tmp"), "leftover").unwrap();
@@ -932,7 +1074,7 @@ mod tests {
         std::fs::remove_dir_all(site.root.join("wp-content/themes")).unwrap();
         let r = recon(&site.root, None).unwrap();
         let a = unpulled(&r, &out.join("no-db")).await;
-        write_reports(&a, &r, &out, Severity::Low, &cfg()).unwrap();
+        write_reports(&a, &r, &out, Severity::Low, &cfg(), None, &[]).unwrap();
         for stale in [
             "defectdojo-themes.json",
             "report-themes.md",
@@ -966,7 +1108,7 @@ mod tests {
         }
         let out = temp_dir("mu-out");
         let a = unpulled(&r, &out.join("no-db")).await;
-        let w = write_reports(&a, &r, &out, Severity::Low, &cfg()).unwrap();
+        let w = write_reports(&a, &r, &out, Severity::Low, &cfg(), None, &[]).unwrap();
 
         let f = findings(&out.join("defectdojo-plugins.json"));
         for name in ["evil", "object-cache"] {
@@ -994,6 +1136,9 @@ mod tests {
             );
         }
         assert!(w.analysis.summary.components.not_looked_up >= 2);
+        // the Markdown summary table adds up to the "not checked" count
+        let md = std::fs::read_to_string(out.join("report-plugins.md")).unwrap();
+        assert!(md.contains("never looked up"), "{md}");
         let m = json(&out.join("dojo-manifest.json"));
         assert!(m["files"].to_string().contains("defectdojo-plugins.json"));
         assert_eq!(m["skipped"].as_array().unwrap().len(), 1); // themes only
@@ -1007,7 +1152,7 @@ mod tests {
         let r = recon(&site.root, None).unwrap();
         let out = temp_dir("mu-only-out");
         let a = unpulled(&r, &out.join("no-db")).await;
-        write_reports(&a, &r, &out, Severity::Low, &cfg()).unwrap();
+        write_reports(&a, &r, &out, Severity::Low, &cfg(), None, &[]).unwrap();
         let f = findings(&out.join("defectdojo-plugins.json"));
         assert_eq!(f.len(), 1, "{f:?}");
         assert_eq!(f[0]["component_name"], "evil");
@@ -1033,7 +1178,7 @@ mod tests {
         // an analysis straight from the analyzer: its warnings are empty
         let a = unpulled(&r, &out.join("no-db")).await;
         assert!(a.warnings.is_empty());
-        let w = write_reports(&a, &r, &out, Severity::Low, &cfg()).unwrap();
+        let w = write_reports(&a, &r, &out, Severity::Low, &cfg(), None, &[]).unwrap();
         assert_eq!(w.analysis.warnings.len(), r.warnings.len());
 
         let first = &r.warnings[0];
@@ -1067,7 +1212,7 @@ mod tests {
 
         let out = temp_dir("unread-out");
         let a = unpulled(&r, &out.join("no-db")).await;
-        let w = write_reports(&a, &r, &out, Severity::Low, &cfg()).unwrap();
+        let w = write_reports(&a, &r, &out, Severity::Low, &cfg(), None, &[]).unwrap();
         assert!(
             w.incomplete_because
                 .iter()
@@ -1086,5 +1231,231 @@ mod tests {
         );
         assert!(recon_markdown(&r).contains("could not be read"));
         let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn a_failed_source_makes_that_file_incomplete_even_if_another_source_answered() {
+        use crate::analyze::Coverage;
+        use crate::vulnerability::SourceKind;
+        let site = Site::new("gap", Some("6.4.3"));
+        site.plugin("akismet", "5.0").plugin("other", "1.0");
+        let r = recon(&site.root, None).unwrap();
+        let mut a = vulnerable_plugin(&r);
+        for c in a.components.iter_mut().filter(|c| c.slug == "akismet") {
+            c.coverage = [
+                (SourceKind::WpVulnerability, Coverage::Failed),
+                (SourceKind::Wordfence, Coverage::Tracked),
+            ]
+            .into_iter()
+            .collect();
+        }
+        let out = temp_dir("gap-out");
+        let w = write_reports(&a, &r, &out, Severity::Low, &cfg(), None, &[]).unwrap();
+        let m = json(&out.join("dojo-manifest.json"));
+        let by_part = |part: &str| {
+            m["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["part"] == part)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_part("plugins")["complete"], false, "{m}");
+        assert!(
+            by_part("plugins")["incomplete_because"]
+                .to_string()
+                .contains("one data source had no answer")
+        );
+        assert_eq!(by_part("core")["complete"], true, "{m}");
+        assert_eq!(m["complete"], false);
+        assert!(!w.incomplete_because.is_empty());
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn reasons_from_the_caller_make_every_file_incomplete() {
+        let site = Site::new("extra", Some("6.4.3"));
+        site.plugin("akismet", "5.0");
+        let r = recon(&site.root, None).unwrap();
+        let a = vulnerable_plugin(&r);
+        let out = temp_dir("extra-out");
+        let why = vec!["Wordfence was enabled but no feed is stored".to_string()];
+        write_reports(&a, &r, &out, Severity::Low, &cfg(), None, &why).unwrap();
+        let m = json(&out.join("dojo-manifest.json"));
+        assert_eq!(m["complete"], false);
+        for f in m["files"].as_array().unwrap() {
+            assert_eq!(f["complete"], false, "{f}");
+            assert_eq!(f["incomplete_because"][0], why[0].as_str());
+        }
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn site_name_of_an_archive_is_the_site_not_the_file() {
+        let d = temp_dir("arch");
+        for (file, want) in [
+            ("shop.tar.gz", "shop"),
+            ("shop.tgz", "shop"),
+            ("shop.zip", "shop"),
+        ] {
+            let f = d.join(file);
+            std::fs::write(&f, "").unwrap();
+            assert_eq!(site_name(&f), want);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn clear_previous_removes_old_results_and_names_the_folder_on_error() {
+        let out = temp_dir("clear");
+        std::fs::write(out.join(MARKER), "").unwrap();
+        for f in [
+            "dojo-manifest.json",
+            "defectdojo-core.json",
+            "report-themes.md",
+            "report.csv",
+        ] {
+            std::fs::write(out.join(f), "old").unwrap();
+        }
+        std::fs::write(out.join("inventory.json"), "keep").unwrap();
+        clear_previous(&out).unwrap();
+        assert!(!out.join("dojo-manifest.json").exists());
+        assert!(!out.join("defectdojo-core.json").exists());
+        assert!(!out.join("report-themes.md").exists());
+        assert!(out.join("inventory.json").exists(), "only report files go");
+
+        let file = out.join("inventory.json");
+        let e = clear_previous(&file).unwrap_err().to_string();
+        assert!(e.contains("inventory.json"), "{e}");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn test_title_names_the_sources_so_runs_with_fewer_never_share_a_test() {
+        let site = Site::new("title", Some("6.4.3"));
+        site.plugin("akismet", "5.0");
+        let r = recon(&site.root, None).unwrap();
+        let mut a = vulnerable_plugin(&r);
+        a.sources = vec![
+            crate::analyze::SourceInfo {
+                source: crate::vulnerability::SourceKind::Wordfence,
+                detail: "feed".into(),
+                attribution: None,
+            },
+            crate::analyze::SourceInfo {
+                source: crate::vulnerability::SourceKind::WpVulnerability,
+                detail: "db".into(),
+                attribution: None,
+            },
+        ];
+        let out = temp_dir("title-out");
+        write_reports(&a, &r, &out, Severity::Low, &cfg(), None, &[]).unwrap();
+        let m = json(&out.join("dojo-manifest.json"));
+        assert_eq!(
+            m["files"][0]["test_title"],
+            "site WordPress core (wordfence+wpvulnerability)"
+        );
+        a.sources.truncate(1);
+        a.sources[0].source = crate::vulnerability::SourceKind::WpVulnerability;
+        write_reports(&a, &r, &out, Severity::Low, &cfg(), None, &[]).unwrap();
+        let m = json(&out.join("dojo-manifest.json"));
+        assert_eq!(
+            m["files"][0]["test_title"],
+            "site WordPress core (wpvulnerability)"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn a_folder_with_foreign_files_is_never_cleared_or_written_into() {
+        let out = temp_dir("foreign");
+        std::fs::write(out.join("report.csv"), "my own data").unwrap();
+        let e = clear_previous(&out).unwrap_err().to_string();
+        assert!(e.contains("did not write"), "{e}");
+        assert_eq!(
+            std::fs::read_to_string(out.join("report.csv")).unwrap(),
+            "my own data"
+        );
+        assert!(!out.join(MARKER).exists());
+
+        // an empty folder is fine, and then recognised as ours
+        let fresh = temp_dir("foreign-fresh");
+        clear_previous(&fresh).unwrap();
+        assert!(fresh.join(MARKER).is_file());
+        std::fs::write(fresh.join("report.csv"), "ours").unwrap();
+        clear_previous(&fresh).unwrap();
+        assert!(!fresh.join("report.csv").exists());
+        let _ = std::fs::remove_dir_all(&out);
+        let _ = std::fs::remove_dir_all(&fresh);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_folder_names_do_not_become_the_parents_name() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = temp_dir("nonutf8");
+        let odd = d.join(std::ffi::OsStr::from_bytes(b"caf\xe9-a"));
+        std::fs::create_dir_all(&odd).unwrap();
+        let name = site_name(&odd);
+        assert!(name.starts_with("caf"), "{name}");
+        assert_ne!(name, site_name(&d));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn archive_names_are_case_insensitive_and_not_looked_through() {
+        let d = temp_dir("arch2");
+        let f = d.join("SHOP.ZIP");
+        std::fs::write(&f, "").unwrap();
+        assert_eq!(site_name(&f), "SHOP");
+        let g = d.join("public_html.tar.gz");
+        std::fs::write(&g, "").unwrap();
+        assert_eq!(site_name(&g), "public_html");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_failed_lookup_in_a_single_source_run_is_reported_once() {
+        use crate::analyze::ComponentState;
+        let site = Site::new("single", Some("6.4.3"));
+        site.plugin("akismet", "5.0");
+        let r = recon(&site.root, None).unwrap();
+        let mut a = vulnerable_plugin(&r);
+        for c in a.components.iter_mut().filter(|c| c.slug == "akismet") {
+            c.state = ComponentState::Failed;
+            c.vulnerabilities.clear();
+            c.coverage = Default::default();
+        }
+        let out = temp_dir("single-out");
+        let w = write_reports(&a, &r, &out, Severity::Low, &cfg(), None, &[]).unwrap();
+        assert_eq!(w.incomplete_because.len(), 1, "{:?}", w.incomplete_because);
+        assert!(w.incomplete_because[0].contains("lookup failed"));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn a_marker_that_is_a_directory_does_not_make_a_folder_ours() {
+        let out = temp_dir("fakemarker");
+        std::fs::create_dir_all(out.join(MARKER)).unwrap();
+        std::fs::write(out.join("report.csv"), "mine").unwrap();
+        assert!(clear_previous(&out).is_err());
+        assert_eq!(
+            std::fs::read_to_string(out.join("report.csv")).unwrap(),
+            "mine"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn a_refused_new_folder_is_removed_again_with_the_parents_it_created() {
+        let parent = temp_dir("refused");
+        let out = parent.join("a/b/reports");
+        let e = clear_previous_checked(&out, &|_| Err(Error::Config("no".into())));
+        assert!(e.is_err());
+        assert!(!out.exists(), "a folder this call created must not stay");
+        assert!(!parent.join("a").exists(), "nor the parents it created");
+        assert!(parent.exists(), "but the existing folder stays");
+        let _ = std::fs::remove_dir_all(&parent);
     }
 }

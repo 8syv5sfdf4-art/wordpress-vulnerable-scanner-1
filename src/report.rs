@@ -200,6 +200,13 @@ pub fn write_markdown<W: Write>(analysis: &Analysis, min: Severity, w: &mut W) -
     ] {
         writeln!(w, "| {label} | {count} |")?;
     }
+    if n.not_looked_up > 0 {
+        writeln!(
+            w,
+            "| not checked: never looked up (must-use plugins, drop-ins) | {} |",
+            n.not_looked_up
+        )?;
+    }
     writeln!(w)?;
 
     if s.total > 0 {

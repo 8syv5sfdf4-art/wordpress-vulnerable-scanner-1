@@ -141,11 +141,94 @@ enum Command {
     /// Manage a local vulnerability database for offline scans
     #[command(subcommand)]
     Db(DbCommand),
+    /// Audit a whole WordPress site (its public_html) in one go: inventory,
+    /// database pull, scan, and one DefectDojo report per part
+    Audit(Box<AuditArgs>),
     /// List installed core, plugins and themes from files (no network, no PHP)
     Inventory(InventoryArgs),
     /// Work with slug aliases (installed folder name -> wordpress.org slug)
     #[command(subcommand)]
     Aliases(AliasesCommand),
+}
+
+/// Everything `audit` takes
+#[derive(ClapArgs, Debug)]
+struct AuditArgs {
+    /// The WordPress root: the directory with wp-config.php and wp-includes
+    /// (usually public_html)
+    path: PathBuf,
+
+    /// Folder for the reports [default: reports/<site>-<date>-<time>]
+    #[arg(short = 'o', long = "out", value_name = "DIR")]
+    out: Option<PathBuf>,
+
+    /// Local vulnerability database, created and refreshed as needed
+    #[arg(
+        long,
+        env = "WPVULN_DB",
+        value_name = "DIR",
+        default_value = "wpvuln-db"
+    )]
+    db: PathBuf,
+
+    /// Aliases file mapping folder names to wordpress.org slugs
+    #[arg(long, env = "WPVULN_ALIASES", value_name = "FILE")]
+    aliases: Option<PathBuf>,
+
+    /// WPVulnerability API base URL
+    #[arg(long, env = "WPVULN_API", value_name = "URL", default_value = WPVULN_API)]
+    api_url: String,
+
+    /// Requests in flight at once (please keep this low; the API is free)
+    #[arg(long, short = 'j', default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..=16))]
+    jobs: u64,
+
+    /// Skip records downloaded less than this many hours ago (0 = always download)
+    #[arg(long, default_value_t = 24, value_name = "HOURS")]
+    max_age: u64,
+
+    /// Do not use Wordfence Intelligence as a second source
+    #[arg(long)]
+    no_wordfence: bool,
+
+    /// Download the Wordfence feed again when it is older than this
+    #[arg(long, default_value_t = 24, value_name = "HOURS")]
+    wordfence_max_age: u64,
+
+    /// Wordfence Intelligence API key; without one the keyless GitHub
+    /// export is used
+    #[arg(
+        long,
+        env = "WORDFENCE_API_KEY",
+        hide_env_values = true,
+        value_name = "KEY"
+    )]
+    api_key: Option<String>,
+
+    /// Report Wordfence's informational records too (as low, marked)
+    #[arg(long)]
+    include_informational: bool,
+
+    /// Lowest severity shown in the Markdown and CSV reports. The DefectDojo
+    /// files always carry everything.
+    #[arg(long = "severity", default_value = "low", value_enum)]
+    min_severity: SeverityArg,
+
+    /// Use only what the database already holds: no downloads at all
+    #[arg(long)]
+    offline: bool,
+
+    /// File with the DEFECTDOJO_* settings
+    #[arg(long, value_name = "FILE")]
+    env: Option<PathBuf>,
+
+    /// Exit non-zero only for vulnerabilities at or above this severity
+    #[arg(long, value_enum, value_name = "SEVERITY")]
+    fail_on: Option<FailOn>,
+
+    /// Also exit 1 when any component could not be checked
+    #[arg(long)]
+    fail_on_unchecked: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -492,6 +575,7 @@ async fn main() -> ExitCode {
 
     let result = match args.command {
         Some(Command::Db(ref cmd)) => run_db(cmd).await,
+        Some(Command::Audit(ref audit)) => run_audit(audit).await,
         Some(Command::Inventory(ref inv)) => run_inventory(inv),
         Some(Command::Aliases(ref cmd)) => run_aliases(cmd).await,
         Some(Command::Scan(ref scan)) => run_scan(scan).await,
@@ -504,6 +588,454 @@ async fn main() -> ExitCode {
             eprintln!("Error: {}", e);
             ExitCode::from(10)
         }
+    }
+}
+
+/// The whole pipeline for one site: recon, database, scan, reports
+async fn run_audit(args: &AuditArgs) -> wordpress_vulnerable_scanner::Result<ExitCode> {
+    use wordpress_vulnerable_scanner::{dojo::DojoConfig, pipeline};
+
+    let s = Style::stdout();
+    let step = |n: u8, what: &str| println!("\n{} {}", s.bold(&format!("[{n}/4]")), s.bold(what));
+
+    let site = pipeline::site_name(&args.path);
+    let out = args
+        .out
+        .clone()
+        .unwrap_or_else(|| pipeline::default_out_dir(&args.path));
+    let today = pipeline::today();
+    // Read the settings first: a typo in .env should stop the run before
+    // anything is downloaded
+    let dojo = match &args.env {
+        Some(file) => DojoConfig::load(file, true, &site, &today)?,
+        None => DojoConfig::load(Path::new(".env"), false, &site, &today)?,
+    };
+
+    println!("{} {} ({})", s.bold("Auditing"), args.path.display(), site);
+
+    // Reports and the database hold inventories and vulnerability details;
+    // inside the web root they could be downloaded
+    for (what, dir) in [("--out", &out), ("--db", &args.db)] {
+        if inside(dir, &args.path) {
+            return Err(wordpress_vulnerable_scanner::Error::Config(format!(
+                "{what} {} is inside the site being audited ({}); anything there may be served \
+                 over the web. Choose a folder outside it.",
+                resolved(dir).display(),
+                resolved(&args.path).display()
+            )));
+        }
+    }
+
+    if resolved(&out) == resolved(&args.db) {
+        return Err(wordpress_vulnerable_scanner::Error::Config(format!(
+            "--out and --db are the same folder ({}); the database would flag the reports as \
+             unexpected files. Use two folders.",
+            resolved(&out).display()
+        )));
+    }
+
+    // 1. Recon
+    step(1, "Reconnaissance: what is installed");
+    let recon = pipeline::recon(&args.path, args.aliases.as_deref())?;
+    // Before anything else is written: a run that fails later must not
+    // leave an earlier run's manifest next to this run's inventory
+    // The folder is checked once it exists, by identity (device and inode
+    // of every ancestor), which sees through symlinks and bind mounts, and
+    // before the marker or any report is written into it
+    pipeline::clear_previous_checked(&out, &|created| {
+        if is_within_by_identity(created, &args.path) {
+            return Err(wordpress_vulnerable_scanner::Error::Config(format!(
+                "--out {} is inside the site being audited; choose a folder outside it",
+                resolved(created).display()
+            )));
+        }
+        Ok(())
+    })?;
+    if let Some(web) = web_root_hint(&out) {
+        println!(
+            "  {} {} looks like a web root (it holds {}); reports there may be downloadable \
+             over HTTP. Prefer a folder outside it.",
+            s.yellow("note:"),
+            web.0.display(),
+            web.1
+        );
+    }
+    let mut extra_incomplete: Vec<String> = Vec::new();
+    pipeline::put(
+        &out,
+        "inventory.json",
+        &serde_json::to_vec_pretty(&recon.inventory)?,
+    )?;
+    pipeline::put(
+        &out,
+        "recon.md",
+        pipeline::recon_markdown(&recon).as_bytes(),
+    )?;
+    let count = |kinds: &[Kind]| {
+        recon
+            .inventory
+            .components
+            .iter()
+            .filter(|c| kinds.contains(&c.kind))
+            .count()
+    };
+    println!(
+        "  core {}, {} theme(s), {} plugin(s), {} must-use plugin(s), {} drop-in(s)",
+        recon
+            .inventory
+            .core
+            .as_ref()
+            .and_then(|c| c.version.as_deref())
+            .unwrap_or("(version unknown)"),
+        count(&[Kind::Theme]),
+        count(&[Kind::Plugin, Kind::Unloaded]),
+        count(&[Kind::MuPlugin]),
+        count(&[Kind::Dropin]),
+    );
+    for d in &recon.unreadable {
+        println!("  {} {d} could not be read", s.red("unreadable:"));
+    }
+    for w in &recon.warnings {
+        println!("  {} {}", s.yellow("warning:"), w.replace('\n', " "));
+    }
+
+    // 2. Database
+    step(
+        2,
+        "Database: vulnerability records for exactly these components",
+    );
+    let items = pull_items(&recon.components);
+    if args.offline {
+        if !args.db.join("wpvuln-db.json").is_file() {
+            return Err(wordpress_vulnerable_scanner::Error::Database(format!(
+                "{} is not a local database, and --offline downloads nothing. Run the audit \
+                 without --offline once (or `db import` a bundle) first.",
+                args.db.display()
+            )));
+        }
+        println!(
+            "  offline: using {} as it is ({} lookups needed)",
+            args.db.display(),
+            items.len()
+        );
+    } else {
+        let opts = PullOptions {
+            api_url: args.api_url.clone(),
+            jobs: args.jobs as usize,
+            max_age: (args.max_age > 0)
+                .then(|| Duration::from_secs(args.max_age.saturating_mul(3600))),
+            ..PullOptions::default()
+        };
+        // Failures are reported by the pull and show up as "not checked"
+        // in the scan; they do not stop the audit
+        pull_cli("Pulling", &args.db, &items, &opts, &[]).await?;
+    }
+    if !args.no_wordfence && !args.offline {
+        audit_wordfence_pull(args).await;
+    }
+    // Records are not re-checked against their checksums while scanning, so
+    // check them here, on both paths and after the Wordfence step (which
+    // may have replaced a damaged feed): a damaged record that still parses
+    // could read as clean. Feed problems only count when the feed is used.
+    let v = db::verify(&args.db, &items);
+    for p in v
+        .problems
+        .iter()
+        .filter(|p| !args.no_wordfence || !p.to_ascii_lowercase().contains("wordfence"))
+    {
+        println!("  {} {p}", s.yellow("database:"));
+        extra_incomplete.push(format!("database problem: {p}"));
+    }
+
+    // 3. Scan
+    step(3, "Scan, offline against the local database");
+    let scan = ScanResult::from_components(recon.components.clone());
+    let mut analyzer = Analyzer::with_source(Source::Local(args.db.clone()))?
+        .include_informational(args.include_informational);
+    if !args.no_wordfence {
+        let feed = wordfence_db::feed_path(&args.db);
+        if feed.is_file() {
+            let (index, detail) = load_wordfence("auto", Some(&args.db), &scan)?;
+            analyzer = analyzer.with_wordfence(index, detail);
+        } else {
+            println!(
+                "  {} no Wordfence feed in {}; WPVulnerability only",
+                s.yellow("note:"),
+                args.db.display()
+            );
+            extra_incomplete.push(
+                "Wordfence was enabled but no feed is stored, so findings only Wordfence \
+                 knows are missing"
+                    .to_string(),
+            );
+        }
+    }
+    let analysis = analyzer.analyze(&scan).await;
+    // What the findings came from, for the DefectDojo test titles: the API
+    // feed holds records the keyless GitHub export lacks
+    let mut sources = vec!["wpvulnerability"];
+    if !args.no_wordfence && wordfence_db::feed_path(&args.db).is_file() {
+        sources.push(match wordfence_db::read_meta(&args.db).map(|m| m.source) {
+            Some(wordfence_db::FeedSource::Api) => "wordfence-api",
+            Some(wordfence_db::FeedSource::Github) => "wordfence-github",
+            None => "wordfence",
+        });
+    }
+    sources.sort();
+    let sources_key = sources.join("+");
+
+    // 4. Reports
+    step(4, "Reports");
+    let written = pipeline::write_reports(
+        &analysis,
+        &recon,
+        &out,
+        args.min_severity.into(),
+        &dojo,
+        Some(&sources_key),
+        &extra_incomplete,
+    )?;
+    let analysis = &written.analysis;
+    for r in &written.parts {
+        let sm = analysis.only(r.part.kind()).summary;
+        match &r.file {
+            Some(file) => println!(
+                "  {:<8} {} component(s): {} critical, {} high, {} medium, {} low; {} not \
+                 checked  -> {}",
+                r.part.name(),
+                r.components,
+                sm.critical,
+                sm.high,
+                sm.medium,
+                sm.low,
+                sm.not_checked,
+                file
+            ),
+            None => println!(
+                "  {:<8} {}",
+                r.part.name(),
+                s.yellow("nothing inventoried, no file written (see dojo-manifest.json)")
+            ),
+        }
+    }
+    println!("\n{} {}", s.bold("Reports in"), out.display());
+    if !written.incomplete_because.is_empty() {
+        println!(
+            "  {} the reports may lack findings, so do not close old findings in DefectDojo \
+             from them:",
+            s.yellow("incomplete:")
+        );
+        for why in &written.incomplete_because {
+            println!("    - {why}");
+        }
+    }
+    let missing = dojo.missing_for_upload();
+    if missing.is_empty() {
+        println!("  DefectDojo settings found; dojo-manifest.json is ready for the upload step.");
+    } else {
+        println!(
+            "  {}",
+            s.dim(&format!(
+                "DefectDojo upload not configured (missing {}); the files are importable by hand.",
+                missing.join(", ")
+            ))
+        );
+    }
+    if analysis.summary.not_checked > 0 {
+        println!(
+            "  {} component(s) could not be checked; they are in the reports as Info findings \
+             tagged not-checked, not as clean.",
+            analysis.summary.not_checked
+        );
+    }
+
+    Ok(ExitCode::from(exit_code(
+        analysis,
+        args.fail_on,
+        args.fail_on_unchecked,
+    )))
+}
+
+/// `path` made absolute, with `..` applied and symlinks resolved as far as
+/// the path exists. Walks one component at a time and canonicalizes
+/// whenever the prefix exists, so the result is what the file system will
+/// make of it, folders that are about to be created included.
+fn resolved(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut cur = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::ParentDir => {
+                cur.pop();
+            }
+            Component::CurDir => {}
+            c => {
+                cur.push(c);
+                if let Ok(real) = std::fs::canonicalize(&cur) {
+                    cur = real;
+                }
+            }
+        }
+    }
+    cur
+}
+
+/// Is `dir` the same as, or below, `root`?
+fn inside(dir: &Path, root: &Path) -> bool {
+    resolved(dir).starts_with(resolved(root))
+}
+
+/// What `audit` does about the Wordfence feed
+#[derive(Debug, PartialEq, Eq)]
+enum WordfenceAction {
+    /// The stored feed is young enough
+    Current,
+    /// An Intelligence API feed is stored, there is no key, and the keyless
+    /// GitHub export (CVE records only, a subset) would replace it
+    KeepApi,
+    /// Download from this source
+    Pull(wordfence_db::FeedSource),
+}
+
+fn wordfence_action(
+    stored: Option<&wordfence_db::Meta>,
+    has_key: bool,
+    max_age_hours: u64,
+    now: u64,
+) -> WordfenceAction {
+    if let Some(m) = stored
+        && max_age_hours > 0
+        && now.saturating_sub(m.fetched_at) < max_age_hours.saturating_mul(3600)
+    {
+        return WordfenceAction::Current;
+    }
+    if let Some(m) = stored
+        && m.source == wordfence_db::FeedSource::Api
+        && !has_key
+    {
+        return WordfenceAction::KeepApi;
+    }
+    WordfenceAction::Pull(if has_key {
+        wordfence_db::FeedSource::Api
+    } else {
+        wordfence_db::FeedSource::Github
+    })
+}
+
+/// The nearest ancestor of `out` that looks like a web root (it holds
+/// `wp-config.php`, `.htaccess` or `index.php`), and which file says so. The
+/// refusal in `audit` protects the WordPress root; this notices a folder
+/// that is still served, such as a document root above a WordPress that
+/// lives in a subfolder, or the working folder when the input is an archive.
+fn web_root_hint(out: &Path) -> Option<(PathBuf, &'static str)> {
+    let mut cur = resolved(out);
+    while cur.pop() {
+        for marker in ["wp-config.php", ".htaccess", "index.php"] {
+            if cur.join(marker).is_file() {
+                return Some((cur, marker));
+            }
+        }
+    }
+    None
+}
+
+/// Is `dir` the same folder as `root`, or below it, judged by device and
+/// inode of `dir` and each of its ancestors? Unlike comparing paths this
+/// sees through symlinks and a bind mount of the site root itself. It does
+/// not see a bind mount of a folder *inside* the site; for that, put
+/// `--out` somewhere you know is not served. An error reading either path
+/// counts as "inside": refusing is the safe answer.
+#[cfg(unix)]
+fn is_within_by_identity(dir: &Path, root: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(root_meta), Ok(mut cur)) = (std::fs::metadata(root), std::fs::canonicalize(dir)) else {
+        return true;
+    };
+    let root_id = (root_meta.dev(), root_meta.ino());
+    loop {
+        match std::fs::metadata(&cur) {
+            Ok(m) if (m.dev(), m.ino()) == root_id => return true,
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+        if !cur.pop() {
+            return false;
+        }
+    }
+}
+
+/// Without device and inode numbers, the resolved-path comparison is all
+/// there is
+#[cfg(not(unix))]
+fn is_within_by_identity(dir: &Path, root: &Path) -> bool {
+    inside(dir, root)
+}
+
+/// Download the Wordfence feed when it is missing or older than the
+/// audit's limit. A failure is a note, not an error: a stored feed or
+/// WPVulnerability alone still gives a scan.
+async fn audit_wordfence_pull(args: &AuditArgs) {
+    let s = Style::stdout();
+    let stored =
+        wordfence_db::read_meta(&args.db).filter(|_| wordfence_db::feed_path(&args.db).is_file());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let has_key = args.api_key.as_deref().is_some_and(|k| !k.is_empty());
+    let source = match wordfence_action(stored.as_ref(), has_key, args.wordfence_max_age, now) {
+        WordfenceAction::Current => {
+            if let Some(m) = &stored {
+                println!(
+                    "  Wordfence feed is current (pulled {}, {} records)",
+                    ago(m.fetched_at),
+                    m.records
+                );
+            }
+            return;
+        }
+        WordfenceAction::KeepApi => {
+            println!(
+                "  {} the stored Wordfence feed (pulled {}) is from the Intelligence API, and \
+                 the keyless GitHub export has fewer records; keeping it. Set \
+                 WORDFENCE_API_KEY to refresh it.",
+                s.yellow("note:"),
+                stored.as_ref().map_or(String::new(), |m| ago(m.fetched_at))
+            );
+            return;
+        }
+        WordfenceAction::Pull(source) => source,
+    };
+    let opts = wordfence_db::PullOptions {
+        from: source,
+        feed: wordfence_db::Feed::Production,
+        api_key: args.api_key.clone(),
+        url: None,
+        force: false,
+        max_bytes: wordfence_db::DEFAULT_MAX_BYTES,
+    };
+    println!(
+        "  Pulling the Wordfence feed from {}",
+        if source == wordfence_db::FeedSource::Api {
+            "the Intelligence API"
+        } else {
+            "GitHub (keyless wpprobe export)"
+        }
+    );
+    match wordfence_db::pull(&args.db, &opts, |_, _| {}, |_, _| {}).await {
+        Ok(wordfence_db::PullOutcome::Updated { meta, .. }) => println!(
+            "  Wordfence feed saved: {} records, {:.1} MB",
+            meta.records,
+            meta.bytes as f64 / 1e6
+        ),
+        Ok(wordfence_db::PullOutcome::NotModified(m)) => {
+            println!("  Wordfence feed unchanged ({} records)", m.records)
+        }
+        Ok(wordfence_db::PullOutcome::TooSoon { meta, .. }) => println!(
+            "  Wordfence allows one API download per 30 minutes; using the stored feed (pulled {})",
+            ago(meta.fetched_at)
+        ),
+        Err(e) => println!("  {} Wordfence feed not updated: {e}", s.yellow("warning:")),
     }
 }
 
@@ -1781,4 +2313,110 @@ fn print_banner() {
     println!("WordPress Vulnerable Scanner v{}", VERSION);
     println!("by Robert F. Ecker <robert@robdotec.com>");
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wordpress_vulnerable_scanner::wordfence::InputFormat;
+
+    fn meta(source: wordfence_db::FeedSource, fetched_at: u64) -> wordfence_db::Meta {
+        wordfence_db::Meta {
+            format: 1,
+            source,
+            url: String::new(),
+            feed: None,
+            fetched_at,
+            sha256: String::new(),
+            bytes: 0,
+            records: 0,
+            slugs: 0,
+            input_format: InputFormat::WordfenceRaw,
+            http_etag: None,
+            http_last_modified: None,
+        }
+    }
+
+    #[test]
+    fn a_stored_api_feed_is_kept_when_there_is_no_key() {
+        let old = meta(wordfence_db::FeedSource::Api, 0);
+        // stale, no key: the smaller keyless export must not replace it
+        assert_eq!(
+            wordfence_action(Some(&old), false, 24, 10_000_000),
+            WordfenceAction::KeepApi
+        );
+        // with a key it is refreshed from the API
+        assert_eq!(
+            wordfence_action(Some(&old), true, 24, 10_000_000),
+            WordfenceAction::Pull(wordfence_db::FeedSource::Api)
+        );
+    }
+
+    #[test]
+    fn feed_age_and_missing_feed() {
+        let fresh = meta(wordfence_db::FeedSource::Github, 9_999_000);
+        assert_eq!(
+            wordfence_action(Some(&fresh), false, 24, 10_000_000),
+            WordfenceAction::Current
+        );
+        // max age 0 means always download
+        assert_eq!(
+            wordfence_action(Some(&fresh), false, 0, 10_000_000),
+            WordfenceAction::Pull(wordfence_db::FeedSource::Github)
+        );
+        assert_eq!(
+            wordfence_action(None, false, 24, 10_000_000),
+            WordfenceAction::Pull(wordfence_db::FeedSource::Github)
+        );
+        assert_eq!(
+            wordfence_action(None, true, 24, 10_000_000),
+            WordfenceAction::Pull(wordfence_db::FeedSource::Api)
+        );
+        // a GitHub feed may be replaced by a newer GitHub export
+        let stale_github = meta(wordfence_db::FeedSource::Github, 0);
+        assert_eq!(
+            wordfence_action(Some(&stale_github), false, 24, 10_000_000),
+            WordfenceAction::Pull(wordfence_db::FeedSource::Github)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_check_sees_through_symlinks_and_dot_dot() {
+        let base = std::env::temp_dir().join(format!("wvs-main-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let site = base.join("site");
+        std::fs::create_dir_all(site.join("inner")).unwrap();
+        std::fs::create_dir_all(base.join("outside")).unwrap();
+        std::os::unix::fs::symlink(&site, base.join("alias")).unwrap();
+
+        assert!(is_within_by_identity(&site.join("inner"), &site));
+        assert!(is_within_by_identity(&base.join("alias/inner"), &site));
+        assert!(!is_within_by_identity(&base.join("outside"), &site));
+        assert!(inside(&base.join("alias/new/folder"), &site));
+        assert!(!inside(&base.join("outside/new"), &site));
+        assert!(inside(
+            &base.join("outside/missing/../../site/reports"),
+            &site
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_web_root_above_the_output_folder_is_noticed() {
+        let base = std::env::temp_dir().join(format!("wvs-hint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("docroot/reports")).unwrap();
+        std::fs::write(base.join("docroot/.htaccess"), "").unwrap();
+        let hint = web_root_hint(&base.join("docroot/reports/run1")).unwrap();
+        assert_eq!(hint.1, ".htaccess");
+        assert!(hint.0.ends_with("docroot"));
+        assert!(
+            web_root_hint(&base.join("elsewhere")).is_none() || {
+                // an ancestor of the temp folder may be a web root on some machines
+                true
+            }
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
